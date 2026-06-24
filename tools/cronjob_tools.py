@@ -67,8 +67,8 @@ def _notify_provider_jobs_changed_safe() -> None:
 #      Skill bodies are user-curated and scanned at install time by
 #      `skills_guard.py`. The runtime cron scan only needs to catch the
 #      patterns whose phrasing does NOT survive normal English prose:
-#      classic prompt-injection directives ("ignore previous instructions",
-#      "disregard your rules"), deception directives, and invisible
+#      classic prompt-injection directives (for example, commands to ignore
+#      earlier instructions), deception directives, and invisible
 #      unicode. `_scan_cron_skill_assembled()` runs against the assembled
 #      prompt with this tighter pattern set.
 #
@@ -121,7 +121,7 @@ _CRON_INVISIBLE_CHARS = {
 }
 
 # U+200D Zero-Width Joiner is also a legitimate, required part of many
-# Unicode emoji sequences (for example 👨‍👩‍👧, 🏳️‍🌈, ❤️‍🩹, 🧑‍💻).
+# Unicode emoji sequences (for example family/rainbow/heart/technologist emoji).
 # We should still block ZWJ when it is hiding between plain text characters,
 # but not when it is clearly part of an emoji grapheme cluster.
 _EMOJI_NEIGHBOUR_CP_RANGES = (
@@ -583,6 +583,12 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+
+        if normalized in {"create", "update", "pause", "resume", "remove", "run"}:
+            from tools.self_modification_guard import self_modification_denial
+            self_mod_err = self_modification_denial(f"{normalized} cron jobs")
+            if self_mod_err:
+                return tool_error(self_mod_err, success=False)
 
         if normalized == "create":
             if not schedule:

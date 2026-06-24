@@ -1928,6 +1928,20 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        # Hard self-modification boundary.  This is intentionally outside and
+        # before the approvable dangerous-command flow: force/yolo/session
+        # approval cannot allow remote messaging origins to mutate or script the
+        # local Hermes host unless the origin is explicitly trusted.
+        from tools.self_modification_guard import check_terminal_self_modification
+        self_mod_err = check_terminal_self_modification(command, env_type, cwd, workdir)
+        if self_mod_err:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": self_mod_err,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:

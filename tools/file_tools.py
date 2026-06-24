@@ -403,7 +403,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     normalized = os.path.normpath(_expand_tilde(filepath))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
-        "Use the terminal tool with sudo if you need to modify system files."
+        "Modify system files manually from a trusted shell if required."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
@@ -1276,6 +1276,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    try:
+        resolved_for_guard = _resolve_path_for_task(path, task_id)
+    except Exception:
+        resolved_for_guard = Path(path)
+    from tools.self_modification_guard import check_file_self_modification
+    self_mod_err = check_file_self_modification(
+        resolved_for_guard, f"write protected file {resolved_for_guard}"
+    )
+    if self_mod_err:
+        return tool_error(self_mod_err)
+
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1379,6 +1390,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        try:
+            resolved_for_guard = _resolve_path_for_task(_p, task_id)
+        except Exception:
+            resolved_for_guard = Path(_p)
+        from tools.self_modification_guard import check_file_self_modification
+        self_mod_err = check_file_self_modification(
+            resolved_for_guard, f"patch protected file {resolved_for_guard}"
+        )
+        if self_mod_err:
+            return tool_error(self_mod_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

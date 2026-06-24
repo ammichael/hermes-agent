@@ -1797,6 +1797,19 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
         return {"approved": True, "message": None}
 
+    from tools.self_modification_guard import check_execute_code_self_modification
+    self_mod_err = check_execute_code_self_modification(env_type)
+    if self_mod_err:
+        return {
+            "approved": False,
+            "message": self_mod_err,
+            "hardline": True,
+            "pattern_key": "self_modification:execute_code",
+            "description": "execute_code from unauthorized origin",
+            "outcome": "blocked",
+            "user_consent": False,
+        }
+
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":

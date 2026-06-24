@@ -1821,9 +1821,36 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_JOB_ID",
+        "HERMES_CRON_JOB_NAME",
+        "HERMES_CRON_SCRIPT",
+        "HERMES_CRON_SCRIPT_SHA256",
     )
+    _prior_cron_env = {name: os.environ.get(name) for name in _cron_delivery_vars}
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+        os.environ.pop(_var_name, None)
+
+    def _set_cron_context_value(_name: str, _value: str) -> None:
+        _VAR_MAP[_name].set(_value)
+        os.environ[_name] = _value
+
+    _set_cron_context_value("HERMES_CRON_JOB_ID", str(job_id))
+    _set_cron_context_value("HERMES_CRON_JOB_NAME", str(job_name))
+    _job_script = str(job.get("script") or "").strip()
+    if _job_script:
+        _set_cron_context_value("HERMES_CRON_SCRIPT", Path(_job_script).name)
+        try:
+            import hashlib
+            _script_path = Path(_job_script).expanduser()
+            if not _script_path.is_absolute():
+                _script_path = _get_hermes_home() / "scripts" / _script_path
+            _script_path = _script_path.resolve()
+            _scripts_dir = (_get_hermes_home() / "scripts").resolve()
+            _script_path.relative_to(_scripts_dir)
+            _set_cron_context_value("HERMES_CRON_SCRIPT_SHA256", hashlib.sha256(_script_path.read_bytes()).hexdigest())
+        except Exception:
+            _set_cron_context_value("HERMES_CRON_SCRIPT_SHA256", "")
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -2260,10 +2287,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Clean up ContextVar session/delivery state for this job.
+        # Clean up ContextVar/session environment delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+            _prior_value = _prior_cron_env.get(_var_name)
+            if _prior_value is None:
+                os.environ.pop(_var_name, None)
+            else:
+                os.environ[_var_name] = _prior_value
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected

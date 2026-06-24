@@ -923,6 +923,13 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # Memory is intentionally writable from every gateway origin. Unlike code,
+    # config, skills, cron jobs or local shell access, memory updates are already
+    # constrained by the memory tool schema, target stores and write gates below.
+    # FinayaOS relies on this so durable preferences/corrections learned in
+    # WhatsApp/Slack groups can be persisted at the point of correction instead
+    # of forcing the user back to a local/allowlisted self-modification channel.
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):

@@ -1016,6 +1016,12 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    if action in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+        from tools.self_modification_guard import self_modification_denial
+        self_mod_err = self_modification_denial(f"{action} skills")
+        if self_mod_err:
+            return tool_error(self_mod_err, success=False)
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is

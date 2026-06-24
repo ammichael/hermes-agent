@@ -78,6 +78,30 @@ def test_memory_gate_off_allows_write(hermes_home):
     assert wa.pending_count("memory") == 0
 
 
+def test_memory_write_is_allowed_from_untrusted_gateway_origin(hermes_home, monkeypatch):
+    """Memory writes are not treated as host self-modification.
+
+    Remote gateway origins should still be blocked from terminal/config/code
+    self-mutation, but durable memory corrections can be persisted from any
+    channel once the model decides the memory tool is appropriate.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools.self_modification_guard import check_terminal_self_modification
+
+    monkeypatch.delenv("HERMES_SELF_MODIFICATION_ALLOWED_ORIGINS", raising=False)
+    tokens = set_session_vars(platform="whatsapp", chat_id="group-not-selfmod@g.us", async_delivery=True)
+    try:
+        assert check_terminal_self_modification("date", "local") is not None
+
+        store = MemoryStore(); store.load_from_disk()
+        r = json.loads(memory_tool("add", "memory", "durable correction from group", store=store))
+        assert r["success"] is True
+        assert any("durable correction from group" in entry for entry in store.memory_entries)
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_memory_gate_on_no_interactive_stages(hermes_home):
     # Gate on, no approval callback / not a gateway context → stage.
     from tools.memory_tool import memory_tool, MemoryStore
