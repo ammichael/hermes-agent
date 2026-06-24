@@ -23,7 +23,7 @@ mixin's methods are called (typically in ``__init__``):
     self._group_policy          # str: "open" | "allowlist" | "disabled"
     self._group_allow_from      # set[str]
     self._mention_patterns      # list[re.Pattern]
-    self._reply_prefix          # Optional[str]
+    self._reply_prefix          # Optional[str] outgoing message header/prefix
 
 Class attributes ``MAX_MESSAGE_LENGTH`` and ``DEFAULT_REPLY_PREFIX`` are
 defined on the mixin and may be overridden per-adapter if needed.
@@ -35,6 +35,8 @@ import json
 import logging
 import os
 import re
+import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -48,6 +50,16 @@ class WhatsAppBehaviorMixin:
     satisfy. This mixin owns no state of its own — every value it touches
     is either a class attribute or set by the adapter's ``__init__``.
     """
+
+    # Host adapter attributes (set by adapter __init__; declared for static checks).
+    config: Any
+    name: str
+    _dm_policy: str
+    _allow_from: set[str]
+    _group_policy: str
+    _group_allow_from: set[str]
+    _mention_patterns: list[re.Pattern[str]]
+    _reply_prefix: Optional[str]
 
     # WhatsApp message limits — practical UX limit, not protocol max.
     # WhatsApp allows ~65K but long messages are unreadable on mobile.
@@ -69,7 +81,7 @@ class WhatsAppBehaviorMixin:
         adapter) can override this to always return ``""`` or apply a
         different policy.
         """
-        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        whatsapp_mode = str(getattr(self, "_whatsapp_mode", None) or os.getenv("WHATSAPP_MODE", "self-chat"))
         if whatsapp_mode != "self-chat":
             return ""
         if self._reply_prefix is not None:
@@ -85,6 +97,21 @@ class WhatsAppBehaviorMixin:
         # Keep enough space for truncate_message's pagination indicator and
         # code-fence repair even if a user configures a very long prefix.
         return max(1024, self.MAX_MESSAGE_LENGTH - prefix_len)
+
+    def _apply_reply_prefix(self, content: str) -> str:
+        """Prepend the configured WhatsApp header/prefix once.
+
+        The prefix is intentionally applied at the WhatsApp adapter boundary,
+        not by prompt instruction, so every text reply is visibly identified as
+        automated even when the model forgets or when a response is produced by
+        gateway/system paths.
+        """
+        prefix = self._effective_reply_prefix()
+        if not prefix or not content:
+            return content
+        if content.startswith(prefix):
+            return content
+        return f"{prefix}{content}"
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -107,6 +134,20 @@ class WhatsAppBehaviorMixin:
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _whatsapp_mention_followup_seconds(self) -> float:
+        raw = self.config.extra.get("mention_followup_seconds")
+        if raw is None:
+            raw = os.getenv("WHATSAPP_MENTION_FOLLOWUP_SECONDS", "120")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[%s] Invalid WhatsApp mention_followup_seconds %r; using 120s",
+                self.name,
+                raw,
+            )
+            return 120.0
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config or env var."""
@@ -122,8 +163,8 @@ class WhatsAppBehaviorMixin:
         if not value:
             return ""
         normalized = str(value).strip()
-        if ":" in normalized and "@" in normalized:
-            normalized = normalized.replace(":", "@", 1)
+        normalized = re.sub(r":.*@", "@", normalized, count=1)
+        normalized = re.sub(r"@\d+@", "@", normalized, count=1)
         return normalized
 
     @staticmethod
@@ -251,6 +292,33 @@ class WhatsAppBehaviorMixin:
         body = str(data.get("body") or "")
         return any(pattern.search(body) for pattern in self._mention_patterns)
 
+    def _group_followup_until(self) -> dict[str, float]:
+        store = getattr(self, "_whatsapp_group_followup_until", None)
+        if store is None:
+            store = {}
+            setattr(self, "_whatsapp_group_followup_until", store)
+        return store
+
+    def _remember_group_followup(self, chat_id: str) -> None:
+        if not chat_id:
+            return
+        window_seconds = self._whatsapp_mention_followup_seconds()
+        if window_seconds <= 0:
+            return
+        self._group_followup_until()[chat_id] = time.monotonic() + window_seconds
+
+    def _group_followup_active(self, chat_id: str) -> bool:
+        if not chat_id:
+            return False
+        store = self._group_followup_until()
+        deadline = store.get(chat_id)
+        if deadline is None:
+            return False
+        if deadline <= time.monotonic():
+            store.pop(chat_id, None)
+            return False
+        return True
+
     def _clean_bot_mention_text(self, text: str, data: Dict[str, Any]) -> str:
         if not text:
             return text
@@ -289,14 +357,36 @@ class WhatsAppBehaviorMixin:
             return True
         if not self._whatsapp_require_mention():
             return True
+
+        # Some deployments want a strict group wake policy: only an explicit
+        # native bot mention or configured wake-word pattern should trigger the
+        # bot in groups.  Keep the historical slash-command/reply/follow-up
+        # behavior unless strict_group_mention is explicitly enabled.
+        strict_group_mention = self.config.extra.get("strict_group_mention")
+        if isinstance(strict_group_mention, str):
+            strict_group_mention = strict_group_mention.lower() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }
+        strict_group_mention = bool(strict_group_mention)
+
+        if self._message_mentions_bot(data):
+            if not strict_group_mention:
+                self._remember_group_followup(chat_id)
+            return True
+        if self._message_matches_mention_patterns(data):
+            return True
+        if strict_group_mention:
+            return False
+
         body = str(data.get("body") or "").strip()
         if body.startswith("/"):
             return True
         if self._message_is_reply_to_bot(data):
             return True
-        if self._message_mentions_bot(data):
-            return True
-        return self._message_matches_mention_patterns(data)
+        return self._group_followup_active(chat_id)
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:
@@ -364,7 +454,7 @@ class WhatsAppBehaviorMixin:
         for i, code in enumerate(codes):
             result = result.replace(f"{_CODE_PH}{i}\x00", code)
 
-        return result
+        return self._apply_reply_prefix(result)
 
 
 # ---------------------------------------------------------------------------
@@ -381,11 +471,10 @@ def resolve_whatsapp_bridge_dir() -> Path:
     Returns the resolved bridge directory path.
     """
     import shutil
-    from pathlib import Path as _Path
 
     # Default location in install tree (may be read-only)
     from hermes_constants import get_hermes_home
-    install_bridge = _Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
+    install_bridge = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
 
     # Try HERMES_HOME location first
     hermes_home = get_hermes_home()

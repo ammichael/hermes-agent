@@ -24,21 +24,29 @@ from unittest.mock import MagicMock, patch
 from hermes_state import SessionDB
 
 
-def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
+def _build_agent_with_db(
+    db: SessionDB,
+    session_id: str,
+    platform: str = "telegram",
+    user_id: str | None = None,
+):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            model="test/model",
-            platform=platform,
-            quiet_mode=True,
-            session_db=db,
-            session_id=session_id,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        kwargs = {
+            "api_key": "test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "test/model",
+            "platform": platform,
+            "quiet_mode": True,
+            "session_db": db,
+            "session_id": session_id,
+            "skip_context_files": True,
+            "skip_memory": True,
+        }
+        if user_id is not None:
+            kwargs["user_id"] = user_id
+        agent = AIAgent(**kwargs)
 
     compressor = MagicMock()
     compressor.compress.return_value = [
@@ -127,3 +135,22 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+class TestUserIdPreservedOnRotation:
+    def test_child_session_keeps_gateway_user_id(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_USER_ROT"
+        db.create_session(parent, source="whatsapp", user_id="user@lid")
+        agent = _build_agent_with_db(
+            db,
+            parent,
+            platform="whatsapp",
+            user_id="user@lid",
+        )
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = db.get_session(getattr(agent, "session_id"))
+        assert child is not None
+        assert child["user_id"] == "user@lid"

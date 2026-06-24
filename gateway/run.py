@@ -68,6 +68,16 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_MAINTENANCE_AUTO_RESUME_BLOCK_RE = re.compile(
+    r"("
+    r"(^|\s)/(?:restart|update)\b"
+    r"|\b(?:restart|restarting|reinici(?:ar|a|e|ando))\b.{0,80}\b(?:gateway|gateways|hermes)\b"
+    r"|\b(?:gateway|gateways|hermes)\b.{0,80}\b(?:restart|restarting|reinici(?:ar|a|e|ando))\b"
+    r"|\b(?:atualiz(?:ar|a|e|ando)|update|updating)\b.{0,80}\b(?:skill|skills|hermes)\b.{0,80}\b(?:restart|reinici(?:ar|a|e|ando))\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -5136,6 +5146,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
+    def _last_user_transcript_message(self, session_id: str) -> str:
+        """Return the latest persisted user message for a session, if any."""
+        try:
+            transcript = self.session_store.load_transcript(session_id)
+        except Exception as exc:
+            logger.debug(
+                "Could not inspect transcript before startup auto-resume for %s: %s",
+                session_id,
+                exc,
+            )
+            return ""
+        for message in reversed(transcript or []):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                    elif isinstance(item, str):
+                        parts.append(item)
+                return "\n".join(parts)
+        return ""
+
+    def _should_block_startup_auto_resume_for_maintenance(self, entry: Any) -> bool:
+        """Prevent startup auto-resume from re-running restart/update commands.
+
+        Gateway maintenance turns are unusually dangerous to synthesize after a
+        crash: the original command already affected process supervision, and
+        replaying it can feed a restart loop.  We keep the transcript intact but
+        clear the resume marker, requiring an explicit fresh human message.
+        """
+        last_user_message = self._last_user_transcript_message(entry.session_id)
+        return bool(
+            last_user_message
+            and _MAINTENANCE_AUTO_RESUME_BLOCK_RE.search(last_user_message)
+        )
+
     async def _run_startup_resume_event(
         self,
         adapter: BasePlatformAdapter,
@@ -5268,6 +5319,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
+                continue
+
+            if self._should_block_startup_auto_resume_for_maintenance(entry):
+                logger.warning(
+                    "Clearing resume_pending for %s: last user message looks like "
+                    "gateway maintenance, so startup auto-resume is unsafe",
+                    entry.session_key,
+                )
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to clear maintenance resume_pending for %s: %s",
+                        entry.session_key,
+                        exc,
+                    )
+                if getattr(entry, "resume_pending", False):
+                    entry.resume_pending = False
+                    entry.resume_reason = None
+                    entry.last_resume_marked_at = None
+                    try:
+                        self.session_store._save()  # noqa: SLF001 - best-effort fallback
+                    except Exception:
+                        pass
                 continue
 
             # Already being resumed (e.g. scheduled at startup and still
@@ -7365,6 +7440,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            if source.platform == Platform.SLACK:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    notion_url = os.getenv(
+                        "FINAYA_PEOPLE_NOTION_URL",
+                        "https://www.notion.so/finaya/f6d68e25a6134439b4c451812bc6d434",
+                    )
+                    await adapter.send(
+                        source.chat_id,
+                        "Não posso seguir com a conversa enquanto sua pessoa não estiver "
+                        "identificada na página Pessoas do Notion. Peça ao responsável para "
+                        f"preencher seu Slack ID em Pessoas: {notion_url}",
+                    )
+                return None
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"

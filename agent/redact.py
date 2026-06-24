@@ -160,6 +160,17 @@ _DB_CONNSTR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Absolute local file paths and common home-directory paths. We redact these
+# in user-facing output because they disclose machine layout, profile names,
+# and filesystem surface area without adding value to the response.
+_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w./:-])(?:"
+    r"~/(?=[^\s`'\"<>])[^\s`'\"<>]*"
+    r"|/(?:Users|Volumes|private|opt|var|tmp|Applications|Library)/[^\s`'\"<>]*"
+    r"|[A-Za-z]:[\\/][^\s`'\"<>]*"
+    r")"
+)
+
 # JWT tokens: header.payload[.signature] — always start with "eyJ" (base64 for "{")
 # Matches 1-part (header only), 2-part (header.payload), and full 3-part JWTs.
 _JWT_RE = re.compile(
@@ -422,6 +433,10 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # Database connection string passwords
     if "://" in text:
         text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+
+    # Absolute local paths (home dir, common macOS/Linux roots, Windows drives)
+    if "/" in text or "~" in text or ":\\" in text:
+        text = _LOCAL_PATH_RE.sub("[LOCAL PATH REDACTED]", text)
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:

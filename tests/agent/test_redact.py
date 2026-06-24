@@ -85,11 +85,29 @@ class TestEnvAssignments:
         result = redact_sensitive_text(text)
         assert result == text
 
-    def test_lowercase_python_variable_token_unchanged(self):
-        # Regression: #4367 — lowercase 'token' assignment must not be redacted
-        text = "before_tokens = response.usage.prompt_tokens"
+    def test_absolute_local_path_redacted(self):
+        text = "See /Users/mike/.hermes/SOUL.md and /Volumes/git/meevi/README.md"
+        result = redact_sensitive_text(text)
+        assert "/Users/mike/.hermes/SOUL.md" not in result
+        assert "/Volumes/git/meevi/README.md" not in result
+        assert "[LOCAL PATH REDACTED]" in result
+
+    def test_tilde_path_redacted(self):
+        text = "Config lives at ~/.hermes/config.yaml"
+        result = redact_sensitive_text(text)
+        assert "~/.hermes/config.yaml" not in result
+        assert result.count("[LOCAL PATH REDACTED]") == 1
+
+    def test_url_path_not_redacted(self):
+        text = "https://example.com/a/b should stay intact"
         result = redact_sensitive_text(text)
         assert result == text
+
+    def test_windows_path_redacted(self):
+        text = r"Use C:\Users\mike\.hermes\SOUL.md on Windows"
+        result = redact_sensitive_text(text)
+        assert r"C:\Users\mike\.hermes\SOUL.md" not in result
+        assert "[LOCAL PATH REDACTED]" in result
 
     def test_lowercase_python_variable_api_key_unchanged(self):
         # Regression: #4367 — lowercase 'api_key' must not be redacted

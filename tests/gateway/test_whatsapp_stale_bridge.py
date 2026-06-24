@@ -53,6 +53,7 @@ def _make_adapter(bridge_script: str = "/tmp/test-bridge.js",
     adapter._bridge_log = None
     adapter._bridge_process = None
     adapter._reply_prefix = None
+    adapter._whatsapp_mode = "self-chat"
     adapter._running = False
     adapter._message_handler = None
     adapter._fatal_error_code = None
@@ -151,7 +152,12 @@ class TestStaleBridgeHandshake:
             session_path=tmp_path / "session",
         )
         disk_hash = _file_content_hash(bridge_dir / "bridge.js")
-        mock_client = _mock_health({"status": "connected", "scriptHash": disk_hash})
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sessionDir": str(adapter._session_path),
+            "mode": "self-chat",
+        })
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
@@ -164,6 +170,69 @@ class TestStaleBridgeHandshake:
         assert result is True
         mock_popen.assert_not_called()  # reused, never spawned
         mock_task.assert_called_once()
+
+
+    @pytest.mark.asyncio
+    async def test_refuses_connected_bridge_with_wrong_session_dir(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sessionDir": str(tmp_path / "other-session"),
+            "mode": "self-chat",
+        })
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("subprocess.Popen") as mock_popen, \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process") as mock_kill_port, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.fatal_error_code == "whatsapp_bridge_identity_mismatch"
+        mock_popen.assert_not_called()
+        mock_kill_port.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refuses_connected_bridge_with_wrong_account_when_known(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        (adapter._session_path / "me_id").write_text("local@s.whatsapp.net")
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sessionDir": str(adapter._session_path),
+            "mode": "self-chat",
+            "meId": "other@s.whatsapp.net",
+        })
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("subprocess.Popen") as mock_popen, \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process") as mock_kill_port, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.fatal_error_code == "whatsapp_bridge_identity_mismatch"
+        mock_popen.assert_not_called()
+        mock_kill_port.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restarts_bridge_on_hash_mismatch(self, tmp_path):

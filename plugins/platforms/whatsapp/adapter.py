@@ -22,6 +22,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -284,6 +285,39 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _resolve_path_for_identity(path: Path | str) -> str:
+    """Resolve *path* for bridge identity checks without requiring it to exist."""
+    try:
+        return str(Path(path).expanduser().resolve(strict=False))
+    except Exception:
+        return str(Path(path).expanduser().absolute())
+
+
+def _normalize_bridge_path(value: Any) -> str:
+    """Resolve bridge/session paths for profile identity comparisons."""
+    if not value:
+        return ""
+    return _resolve_path_for_identity(str(value))
+
+
+def _normalize_whatsapp_id(value: Any) -> str:
+    """Normalize Baileys WhatsApp account identifiers for equality checks."""
+    if not value:
+        return ""
+    text = str(value).strip().replace("\n", "")
+    text = text.split(":", 1)[0]
+    text = text.split("@", 1)[0]
+    return text
+
+
+def _read_local_me_id(session_path: Path) -> str:
+    """Read the locally persisted WhatsApp account id, if known."""
+    try:
+        return (session_path / "me_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -356,6 +390,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._whatsapp_mode = str(
+            config.extra.get("mode")
+            or config.extra.get("whatsapp_mode")
+            or os.getenv("WHATSAPP_MODE", "self-chat")
+        )
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "open")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "open")).strip().lower()
@@ -391,6 +430,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        _recent_context_enabled_raw = config.extra.get("context_backfill_enabled", True)
+        self._recent_context_enabled = (
+            _recent_context_enabled_raw
+            if isinstance(_recent_context_enabled_raw, bool)
+            else str(_recent_context_enabled_raw).strip().lower() in {"1", "true", "yes", "on"}
+        )
+        self._recent_context_message_limit = max(
+            0,
+            int(config.extra.get("context_backfill_messages", 8) or 0),
+        )
+        self._recent_context_max_age_seconds = max(
+            0.0,
+            float(config.extra.get("context_backfill_max_age_seconds", 15 * 60) or 0),
+        )
+        self._recent_context_max_chars = max(
+            200,
+            int(config.extra.get("context_backfill_max_chars", 1600) or 1600),
+        )
+        self._recent_chat_messages: Dict[str, list[Dict[str, Any]]] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -410,6 +468,93 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    def _record_recent_channel_message(self, data: Dict[str, Any]) -> None:
+        """Keep a small per-chat buffer of recent WhatsApp group messages."""
+        if not getattr(self, "_recent_context_enabled", True) or not data.get("isGroup"):
+            return
+        chat_id = str(data.get("chatId") or "").strip()
+        if not chat_id:
+            return
+
+        body = str(data.get("body") or "").strip()
+        if not body:
+            if data.get("hasMedia"):
+                media_type = str(data.get("mediaType") or "media").strip() or "media"
+                body = f"[{media_type} received]"
+            else:
+                return
+
+        sender_name = str(data.get("senderName") or "Participante").strip()
+        sender_name = re.sub(r"\s+", " ", sender_name)[:80] or "Participante"
+        if re.fullmatch(r"\+?[\d\s().-]{6,}", sender_name) or "@" in sender_name:
+            sender_name = "Participante"
+        body = re.sub(r"\s+", " ", body)[:500]
+        body = re.sub(r"\b\d{6,}\b", "[número]", body)
+        entry = {
+            "message_id": str(data.get("messageId") or ""),
+            "ts": float(data.get("timestamp") or time.time()),
+            "seen_at": time.time(),
+            "sender_name": sender_name,
+            "body": body,
+            "has_quoted_message": bool(data.get("hasQuotedMessage")),
+        }
+
+        messages = self._recent_chat_messages.setdefault(chat_id, [])
+        if entry["message_id"] and any(m.get("message_id") == entry["message_id"] for m in messages):
+            return
+        messages.append(entry)
+        max_keep = max(
+            getattr(self, "_recent_context_message_limit", 8) * 3,
+            getattr(self, "_recent_context_message_limit", 8),
+            20,
+        )
+        if len(messages) > max_keep:
+            del messages[:-max_keep]
+
+    def _build_recent_channel_context(self, data: Dict[str, Any]) -> Optional[str]:
+        """Return a compact context block from recent same-chat group messages."""
+        if (
+            not getattr(self, "_recent_context_enabled", True)
+            or not data.get("isGroup")
+            or getattr(self, "_recent_context_message_limit", 8) <= 0
+        ):
+            return None
+        chat_id = str(data.get("chatId") or "").strip()
+        if not chat_id:
+            return None
+
+        current_message_id = str(data.get("messageId") or "")
+        now_seen = time.time()
+        max_age = getattr(self, "_recent_context_max_age_seconds", 15 * 60)
+        recent = []
+        for entry in getattr(self, "_recent_chat_messages", {}).get(chat_id, []):
+            if current_message_id and entry.get("message_id") == current_message_id:
+                continue
+            if max_age and now_seen - float(entry.get("seen_at") or 0) > max_age:
+                continue
+            recent.append(entry)
+        if not recent:
+            return None
+
+        selected = recent[-getattr(self, "_recent_context_message_limit", 8):]
+        lines = [
+            "[Contexto local recente do grupo WhatsApp — mensagens imediatamente anteriores ao gatilho neste mesmo chat]"
+        ]
+        for entry in selected:
+            sender = entry.get("sender_name") or "Participante"
+            body = entry.get("body") or ""
+            quote_hint = " replied" if entry.get("has_quoted_message") else ""
+            lines.append(f"- {sender}{quote_hint}: {body}")
+        lines.append("[Fim do contexto local recente do grupo WhatsApp]")
+        context = "\n".join(lines)
+        max_chars = getattr(self, "_recent_context_max_chars", 1600)
+        if len(context) > max_chars:
+            context = (
+                context[: max_chars - 40].rstrip()
+                + "…\n[End recent WhatsApp group context]"
+            )
+        return context
 
     async def connect(self) -> bool:
         """
@@ -519,6 +664,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             
             # Check if bridge is already running and connected
             import aiohttp
+            whatsapp_mode = str(getattr(self, "_whatsapp_mode", None) or os.getenv("WHATSAPP_MODE", "self-chat"))
+            expected_session_dir = _normalize_bridge_path(self._session_path)
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -540,17 +687,46 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # treated as stale by definition.
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
-                                if running_hash and disk_hash and running_hash == disk_hash:
+                                if not (running_hash and disk_hash and running_hash == disk_hash):
+                                    print(
+                                        f"[{self.name}] Running bridge is stale "
+                                        f"(running={running_hash or 'unversioned'}, disk={disk_hash}), restarting"
+                                    )
+                                else:
+                                    identity_errors = []
+                                    running_session_dir = _normalize_bridge_path(data.get("sessionDir"))
+                                    if not running_session_dir:
+                                        identity_errors.append("missing_sessionDir")
+                                    elif running_session_dir != expected_session_dir:
+                                        identity_errors.append("sessionDir")
+
+                                    running_mode = str(data.get("mode") or "")
+                                    if not running_mode or running_mode != whatsapp_mode:
+                                        identity_errors.append("mode")
+
+                                    local_me_id = _normalize_whatsapp_id(_read_local_me_id(self._session_path))
+                                    running_me_id = _normalize_whatsapp_id(data.get("meId"))
+                                    if local_me_id and running_me_id and local_me_id != running_me_id:
+                                        identity_errors.append("meId")
+
+                                    if identity_errors:
+                                        logger.error(
+                                            "[%s] Refusing to reuse WhatsApp bridge on port %s: identity mismatch (%s)",
+                                            self.name, self._bridge_port, ",".join(identity_errors),
+                                        )
+                                        self._set_fatal_error(
+                                            "whatsapp_bridge_identity_mismatch",
+                                            "WhatsApp bridge identity does not match configured session/mode/account.",
+                                            retryable=False,
+                                        )
+                                        return False
+
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                print(
-                                    f"[{self.name}] Running bridge is stale "
-                                    f"(running={running_hash or 'unversioned'}, disk={disk_hash}), restarting"
-                                )
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
             except Exception:
@@ -564,7 +740,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
             # messages are preserved for troubleshooting.
-            whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
@@ -1142,7 +1317,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
+            channel_context = self._build_recent_channel_context(data)
             if not self._should_process_message(data):
+                self._record_recent_channel_message(data)
                 return None
 
             # Determine message type
@@ -1264,7 +1441,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            return MessageEvent(
+            event = MessageEvent(
                 text=body,
                 message_type=msg_type,
                 source=source,
@@ -1273,6 +1450,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 media_urls=cached_urls,
                 media_types=media_types,
             )
+            event.channel_context = channel_context
+            self._record_recent_channel_message(data)
+            return event
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
@@ -1309,17 +1489,40 @@ async def _standalone_send(
     _send_whatsapp helper.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+
+    def _with_reply_prefix(text: str) -> str:
+        prefix = extra.get("reply_prefix")
+        if prefix is None:
+            prefix = os.getenv("WHATSAPP_REPLY_PREFIX", "")
+        prefix = str(prefix or "").replace("\\n", "\n")
+        if not prefix or not text or text.startswith(prefix):
+            return text
+        return f"{prefix}{text}"
+
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         bridge_port = extra.get("bridge_port", 3000)
+        expected_session_dir = _normalize_bridge_path(
+            extra.get("session_path")
+            or get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
+        )
         normalized_chat_id = to_whatsapp_jid(chat_id)
         async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://localhost:{bridge_port}/health",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as health_resp:
+                if health_resp.status == 200:
+                    health = await health_resp.json()
+                    running_session_dir = _normalize_bridge_path(health.get("sessionDir"))
+                    if not running_session_dir or running_session_dir != expected_session_dir:
+                        return {"error": "WhatsApp bridge identity mismatch; refusing cross-profile send"}
             async with session.post(
                 f"http://localhost:{bridge_port}/send",
-                json={"chatId": normalized_chat_id, "message": message},
+                json={"chatId": normalized_chat_id, "message": _with_reply_prefix(message)},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:

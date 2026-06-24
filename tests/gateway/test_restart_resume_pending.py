@@ -20,9 +20,10 @@ PRs #9850, #9934, #7536):
    shape so it fires even when the interrupted transcript does NOT end
    with a ``tool`` role.
 
-4. The existing ``.restart_failure_counts`` stuck-loop counter from
-   PR #7536 remains the single source of escalation — no parallel
-   counter is added on ``SessionEntry``.
+4. A repeated interruption of the same still-pending resume inside the
+   circuit-breaker window is escalated to ``suspended=True`` immediately;
+   the existing ``.restart_failure_counts`` startup counter remains as the
+   fallback for older restart loops.
 """
 
 import asyncio
@@ -274,6 +275,25 @@ class TestMarkResumePending:
 
         store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
         assert store._entries[entry.session_key].resume_reason == "shutdown_timeout"
+
+    def test_repeated_pending_mark_within_window_suspends(self, tmp_path):
+        """Two interrupted resume attempts in the same session within 10 min
+        trip the breaker instead of leaving startup auto-resume armed."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        t0 = datetime(2026, 6, 24, 10, 0, 0)
+
+        with patch("gateway.session._now", return_value=t0):
+            assert store.mark_resume_pending(entry.session_key, reason="shutdown_timeout") is True
+        with patch("gateway.session._now", return_value=t0 + timedelta(minutes=5)):
+            assert store.mark_resume_pending(entry.session_key, reason="shutdown_timeout") is False
+
+        e = store._entries[entry.session_key]
+        assert e.suspended is True
+        assert e.resume_pending is False
+        assert e.resume_reason is None
+        assert e.last_resume_marked_at is None
 
     def test_returns_false_for_unknown_key(self, tmp_path):
         store = _make_store(tmp_path)
@@ -1018,6 +1038,40 @@ async def test_startup_auto_resume_skips_stale_entries():
 
     assert scheduled == 0
     adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_clears_maintenance_command_sessions():
+    """A restart/update maintenance command must not be synthesized again."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="maintenance-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:maintenance-chat",
+        session_id="sid-maint",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="shutdown_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(
+        return_value=[
+            {"role": "user", "content": "atualizar skill e reiniciar gateways"},
+            {"role": "assistant", "content": "reiniciando"},
+        ]
+    )
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.resume_pending is False
+    assert pending_entry.resume_reason is None
 
 
 @pytest.mark.asyncio

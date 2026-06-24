@@ -54,6 +54,21 @@ def _hash_chat_id(value: str) -> str:
     return _hash_id(value)
 
 
+def _finaya_slack_identity(slack_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return the local Finaya Pessoas identity for a Slack sender, if present."""
+    if not slack_id:
+        return None
+    try:
+        cache_path = Path.home() / ".hermes/profiles/finaya/cache/person-identity-index.json"
+        data = json.loads(cache_path.read_text())
+        for entry in data.get("entries", []):
+            if entry.get("slack_id") == slack_id:
+                return entry
+    except Exception:
+        return None
+    return None
+
+
 from .config import (
     Platform,
     GatewayConfig,
@@ -363,6 +378,42 @@ def build_session_context_prompt(
 
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
+        ident = _finaya_slack_identity(context.source.user_id)
+        if ident:
+            person_page_id = str(ident.get("person_page_id", ""))
+            person_url = "https://www.notion.so/finaya/" + person_page_id.replace("-", "")
+            lines.append("")
+            lines.append("**Finaya identity (from Notion Pessoas):**")
+            lines.append(f"  - Person: {ident.get('name') or context.source.user_name}")
+            if ident.get("email"):
+                lines.append(f"  - Email: {ident.get('email')}")
+            if ident.get("roles"):
+                lines.append(f"  - Roles: {', '.join(ident.get('roles') or [])}")
+            if ident.get("departments"):
+                lines.append(f"  - Departments: {', '.join(ident.get('departments') or [])}")
+            if ident.get("squads"):
+                lines.append(f"  - Squads: {', '.join(ident.get('squads') or [])}")
+            lines.append(f"  - Notion Pessoas: {person_url}")
+            lines.append(
+                "**Finaya identity rule:** Before acting on Slack requests, consider "
+                "the person's identity, role, department, context and permissions. "
+                "If the request exceeds what this identity should access or perform, "
+                "ask for explicit approval or refuse."
+            )
+        if context.source.chat_type == "dm":
+            lines.append("")
+            lines.append(
+                "**Slack audience mode:** private chat. Be concise and action-oriented; "
+                "include technical detail only when useful for the requester or explicitly asked."
+            )
+        else:
+            lines.append("")
+            lines.append(
+                "**Slack audience mode:** shared channel/thread. Answer directly, naturally "
+                "and with minimal backend detail. Do not expose cache, commands, guards, "
+                "allowlists, logs, local paths or internal IDs unless technical diagnosis is requested."
+            )
+
         lines.append("")
         lines.append(
             "**Platform notes:** You are running inside Slack. "
@@ -372,6 +423,37 @@ def build_session_context_prompt(
             "current message's Slack block/attachment payload when available, but "
             "you still cannot call Slack APIs yourself."
         )
+    elif context.source.platform == Platform.WHATSAPP:
+        src = context.source
+        is_admin_group = (
+            src.chat_type == "group"
+            and (src.chat_name or "").strip().lower() == "finayaos"
+        )
+        lines.append("")
+        if is_admin_group:
+            lines.append(
+                "**WhatsApp audience mode:** admin/debug group. You may include "
+                "technical cause, config, logs, guards and validation details when "
+                "they help the workspace operator run FinayaOS, but still keep the answer "
+                "short and redact secrets, raw identifiers and local paths."
+            )
+        elif src.chat_type == "group":
+            lines.append(
+                "**WhatsApp audience mode:** internal group with other people. "
+                "Answer like a helpful teammate: direct, friendly, natural and "
+                "propositive. Give the useful answer first. Do NOT expose backend "
+                "details such as cache, commands, terminal, guard, allowlist, logs, "
+                "local paths, internal IDs, stack traces or timestamps unless the "
+                "group explicitly asks for technical diagnosis. If data may be stale, "
+                "say simply: 'tenho isso pela base sincronizada; posso validar na "
+                "fonte oficial se precisar'."
+            )
+        else:
+            lines.append(
+                "**WhatsApp audience mode:** private chat. Keep replies concise, "
+                "natural and action-oriented. Share technical detail only when it is "
+                "needed for the user's decision or explicitly requested."
+            )
     elif context.source.platform == Platform.DISCORD:
         # Inject the Discord IDs block only when the agent actually has
         # Discord tools loaded this session — i.e. the user opted into
@@ -469,6 +551,9 @@ def build_session_context_prompt(
     return "\n".join(lines)
 
 
+RESUME_PENDING_CIRCUIT_BREAKER_SECONDS = 10 * 60
+
+
 @dataclass
 class SessionEntry:
     """
@@ -532,9 +617,10 @@ class SessionEntry:
     # ``resume_pending`` preserves the existing session_id on next access —
     # the user stays on the same transcript and the agent auto-continues
     # from where it left off.  Cleared after the next successful turn.
-    # Escalation to ``suspended`` is handled by the existing
-    # ``.restart_failure_counts`` stuck-loop counter (#7536), not by a
-    # parallel counter on this entry.
+    # Escalation to ``suspended`` happens in two places: an immediate
+    # mark-time circuit breaker below when the same still-pending session is
+    # interrupted again within a short window, and the persisted
+    # ``.restart_failure_counts`` startup counter for older crash loops.
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
@@ -1148,9 +1234,29 @@ class SessionStore:
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
+                now = _now()
+                if entry.resume_pending:
+                    marker = entry.last_resume_marked_at or entry.updated_at
+                    if (
+                        marker is not None
+                        and (now - marker).total_seconds()
+                        <= RESUME_PENDING_CIRCUIT_BREAKER_SECONDS
+                    ):
+                        entry.suspended = True
+                        entry.resume_pending = False
+                        entry.resume_reason = None
+                        entry.last_resume_marked_at = None
+                        self._save()
+                        logger.warning(
+                            "Auto-suspended session %s after repeated resume_pending "
+                            "interruption within %d seconds",
+                            session_key,
+                            RESUME_PENDING_CIRCUIT_BREAKER_SECONDS,
+                        )
+                        return False
                 entry.resume_pending = True
                 entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
+                entry.last_resume_marked_at = now
                 self._save()
                 return True
         return False

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -5,7 +6,9 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  mention_followup_seconds=None, context_backfill_messages=None,
+                  context_backfill_max_age_seconds=None, reply_prefix=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +26,14 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if mention_followup_seconds is not None:
+        extra["mention_followup_seconds"] = mention_followup_seconds
+    if context_backfill_messages is not None:
+        extra["context_backfill_messages"] = context_backfill_messages
+    if context_backfill_max_age_seconds is not None:
+        extra["context_backfill_max_age_seconds"] = context_backfill_max_age_seconds
+    if reply_prefix is not None:
+        extra["reply_prefix"] = reply_prefix
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -33,7 +44,14 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._group_policy = str(extra.get("group_policy", "open")).strip().lower()
     adapter._group_allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("group_allow_from"))
     adapter._mention_patterns = adapter._compile_mention_patterns()
+    adapter._reply_prefix = extra.get("reply_prefix")
+    adapter._whatsapp_mode = str(extra.get("mode") or extra.get("whatsapp_mode") or "self-chat")
     adapter._free_response_chats = adapter._whatsapp_free_response_chats()
+    adapter._recent_context_enabled = bool(extra.get("context_backfill_enabled", True))
+    adapter._recent_context_message_limit = int(extra.get("context_backfill_messages", 8) or 0)
+    adapter._recent_context_max_age_seconds = float(extra.get("context_backfill_max_age_seconds", 15 * 60) or 0)
+    adapter._recent_context_max_chars = int(extra.get("context_backfill_max_chars", 1600) or 1600)
+    adapter._recent_chat_messages = {}
     return adapter
 
 
@@ -88,6 +106,152 @@ def test_group_messages_can_require_direct_trigger_via_config():
         )
     ) is True
     assert adapter._should_process_message(_group_message("/status")) is True
+
+
+def test_group_mentions_match_bot_ids_with_device_suffixes():
+    adapter = _make_adapter(require_mention=True)
+
+    assert adapter._should_process_message(
+        _group_message(
+            "@23451242868882 ajuste isso",
+            botIds=["5511983176725:1@s.whatsapp.net", "23451242868882:1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    ) is True
+
+
+def test_group_mentions_match_already_malformed_device_suffixes():
+    adapter = _make_adapter(require_mention=True)
+
+    assert adapter._should_process_message(
+        _group_message(
+            "@23451242868882 ajuste isso",
+            botIds=["5511983176725@1@s.whatsapp.net", "23451242868882@1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    ) is True
+
+
+def test_direct_group_mention_opens_two_minute_followup_window(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(
+        "gateway.platforms.whatsapp_common.time.monotonic",
+        lambda: now[0],
+    )
+    adapter = _make_adapter(require_mention=True)
+
+    assert adapter._should_process_message(
+        _group_message(
+            "@23451242868882 acompanha aqui",
+            botIds=["23451242868882:1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    ) is True
+
+    now[0] += 119.0
+    assert adapter._should_process_message(_group_message("continuação sem menção")) is True
+
+    now[0] += 2.0
+    assert adapter._should_process_message(_group_message("fora da janela")) is False
+
+
+def test_direct_group_mention_followup_window_can_be_disabled():
+    adapter = _make_adapter(require_mention=True, mention_followup_seconds=0)
+
+    assert adapter._should_process_message(
+        _group_message(
+            "@23451242868882 só essa",
+            botIds=["23451242868882:1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("sem acompanhamento")) is False
+
+
+def test_group_mention_receives_recent_ignored_chat_context():
+    adapter = _make_adapter(require_mention=True, context_backfill_messages=3)
+
+    async def _drive():
+        assert await adapter._build_message_event(
+            _group_message(
+                "Quem n tá com rabo arregaçado levanta a mão",
+                messageId="m1",
+                senderName="Sammuel",
+                timestamp=1000,
+            )
+        ) is None
+        assert await adapter._build_message_event(
+            _group_message(
+                "meu rabo já está arregaçado e nem entrou o da RB ainda 🥹",
+                messageId="m2",
+                senderName="Elder",
+                timestamp=1001,
+            )
+        ) is None
+        event = await adapter._build_message_event(
+            _group_message(
+                "@23451242868882 me ajude no argumento aqui com o Sammuel",
+                messageId="m3",
+                senderName="Example User",
+                timestamp=1002,
+                botIds=["23451242868882:1@lid"],
+                mentionedIds=["23451242868882@lid"],
+            )
+        )
+        return event
+
+    event = asyncio.run(_drive())
+
+    assert event is not None
+    assert event.channel_context is not None
+    assert "Contexto local recente do grupo WhatsApp" in event.channel_context
+    assert "Sammuel: Quem n tá com rabo arregaçado" in event.channel_context
+    assert "Elder: meu rabo já está arregaçado" in event.channel_context
+    assert "me ajude no argumento" not in event.channel_context
+
+
+def test_group_context_backfill_respects_message_limit():
+    adapter = _make_adapter(require_mention=True, context_backfill_messages=2)
+
+    adapter._record_recent_channel_message(_group_message("one", messageId="m1", senderName="A"))
+    adapter._record_recent_channel_message(_group_message("two", messageId="m2", senderName="B"))
+    adapter._record_recent_channel_message(_group_message("three", messageId="m3", senderName="C"))
+
+    context = adapter._build_recent_channel_context(
+        _group_message(
+            "@23451242868882 ajuda",
+            messageId="m4",
+            botIds=["23451242868882:1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    )
+
+    assert context is not None
+    assert "A: one" not in context
+    assert "B: two" in context
+    assert "C: three" in context
+
+
+def test_group_context_backfill_redacts_phone_like_sender_and_body_numbers():
+    adapter = _make_adapter(require_mention=True, context_backfill_messages=2)
+
+    adapter._record_recent_channel_message(
+        _group_message("fala com 5511999999999", messageId="m1", senderName="551188887777")
+    )
+
+    context = adapter._build_recent_channel_context(
+        _group_message(
+            "@23451242868882 ajuda",
+            messageId="m2",
+            botIds=["23451242868882:1@lid"],
+            mentionedIds=["23451242868882@lid"],
+        )
+    )
+
+    assert context is not None
+    assert "551188887777" not in context
+    assert "5511999999999" not in context
+    assert "Participante: fala com [número]" in context
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():
@@ -370,3 +534,67 @@ def test_is_broadcast_chat_helper_recognizes_common_jids():
     assert WhatsAppAdapter._is_broadcast_chat("120363001234567890@g.us") is False
     assert WhatsAppAdapter._is_broadcast_chat("") is False
     assert WhatsAppAdapter._is_broadcast_chat(None) is False  # type: ignore[arg-type]
+
+
+
+def test_whatsapp_format_message_prepends_configured_header_once():
+    adapter = _make_adapter(reply_prefix="*Finaya_*\n\n")
+
+    assert adapter.format_message("Fechado, Bruce.") == "*Finaya_*\n\nFechado, Bruce."
+    assert adapter.format_message("*Finaya_*\n\nFechado, Bruce.") == "*Finaya_*\n\nFechado, Bruce."
+
+
+def test_whatsapp_format_message_keeps_header_with_markdown_conversion():
+    adapter = _make_adapter(reply_prefix="*Finaya_*\n\n")
+
+    assert adapter.format_message("**Título**") == "*Finaya_*\n\n*Título*"
+
+
+
+def test_whatsapp_session_context_marks_internal_group_audience():
+    from gateway.config import Platform
+    from gateway.session import SessionContext, SessionSource, build_session_context_prompt
+
+    prompt = build_session_context_prompt(
+        SessionContext(
+            source=SessionSource(
+                platform=Platform.WHATSAPP,
+                chat_id="120363111111111111@g.us",
+                chat_name="Pessoas - Finaya",
+                chat_type="group",
+                user_id="sender@s.whatsapp.net",
+                user_name="Maria",
+            ),
+            connected_platforms=[Platform.WHATSAPP],
+            home_channels={},
+        ),
+        redact_pii=True,
+    )
+
+    assert "WhatsApp audience mode" in prompt
+    assert "internal group with other people" in prompt
+    assert "Do NOT expose backend details" in prompt
+
+
+def test_whatsapp_session_context_marks_finayaos_admin_group():
+    from gateway.config import Platform
+    from gateway.session import SessionContext, SessionSource, build_session_context_prompt
+
+    prompt = build_session_context_prompt(
+        SessionContext(
+            source=SessionSource(
+                platform=Platform.WHATSAPP,
+                chat_id="120363222222222222@g.us",
+                chat_name="FinayaOS",
+                chat_type="group",
+                user_id="sender@s.whatsapp.net",
+                user_name="Example User",
+            ),
+            connected_platforms=[Platform.WHATSAPP],
+            home_channels={},
+        ),
+        redact_pii=True,
+    )
+
+    assert "admin/debug group" in prompt
+    assert "technical cause" in prompt

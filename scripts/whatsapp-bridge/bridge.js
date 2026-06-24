@@ -45,7 +45,7 @@ const WHATSAPP_DEBUG =
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
 const PORT = parseInt(getArg('port', '3000'), 10);
-const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const SESSION_DIR = path.resolve(getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session')));
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -141,7 +141,23 @@ function trackSentMessageId(sent) {
 
 function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  return String(value)
+    .replace(/:.*@/, '@')
+    .replace(/@\d+@/, '@');
+}
+
+function currentMeId() {
+  const id = normalizeWhatsAppId(sock?.user?.id || sock?.user?.jid || '');
+  if (id) {
+    try {
+      writeFileSync(path.join(SESSION_DIR, 'me_id'), id, 'utf8');
+    } catch {}
+    return id;
+  }
+  try {
+    return normalizeWhatsAppId(readFileSync(path.join(SESSION_DIR, 'me_id'), 'utf8').trim());
+  } catch {}
+  return '';
 }
 
 function getMessageContent(msg) {
@@ -321,7 +337,12 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        // DMs are gated by WHATSAPP_ALLOWED_USERS at the bridge boundary.
+        // Group access is decided by the Python gateway (group_policy +
+        // require_mention/wake words).  Forward group messages so mentions from
+        // non-DM-allowlisted participants can still wake the bot and so the
+        // gateway can keep a short local context buffer for later mentions.
+        if (!isGroup && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -721,6 +742,9 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    sessionDir: SESSION_DIR,
+    mode: WHATSAPP_MODE,
+    meId: currentMeId(),
   });
 });
 
