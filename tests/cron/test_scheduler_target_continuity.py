@@ -153,3 +153,60 @@ def test_origin_scope_does_not_attach_explicit_other_target():
     assert error is None
     adapter._session_store.get_or_create_session.assert_not_called()
     mirror.assert_not_called()
+
+
+def test_target_scope_seeds_cold_session_on_standalone_delivery(tmp_path):
+    """Standalone fallback must create the destination before mirroring it."""
+    from cron.scheduler import _deliver_result
+    from gateway.config import Platform
+
+    target_chat = "cold-target@g.us"
+    origin_user = "owner@lid"
+    pconfig = MagicMock(enabled=True, extra={})
+    cfg = MagicMock(platforms={Platform.WHATSAPP: pconfig})
+    cfg.sessions_dir = tmp_path / "sessions"
+    session_store = MagicMock(spec=["get_or_create_session"])
+
+    job = {
+        "id": "cold-standalone-target",
+        "name": "Cold standalone target",
+        "deliver": f"whatsapp:{target_chat}",
+        "origin": {
+            "platform": "whatsapp",
+            "chat_id": "origin@lid",
+            "user_id": origin_user,
+        },
+        "attach_to_session": True,
+    }
+
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch(
+             "cron.scheduler.load_config",
+             return_value={
+                 "cron": {
+                     "wrap_response": False,
+                     "mirror_delivery_scope": "target",
+                 }
+             },
+         ), \
+         patch(
+             "tools.send_message_tool._send_to_platform",
+             new=AsyncMock(return_value={"success": True}),
+         ), \
+         patch("gateway.session.SessionStore", return_value=session_store) as store_cls, \
+         patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
+        error = _deliver_result(
+            job,
+            "Cold destination can continue this briefing.",
+            adapters=None,
+            loop=None,
+        )
+
+    assert error is None
+    store_cls.assert_called_once_with(cfg.sessions_dir, cfg)
+    session_store.get_or_create_session.assert_called_once()
+    seeded = session_store.get_or_create_session.call_args.args[0]
+    assert str(seeded.chat_id) == target_chat
+    assert str(seeded.user_id) == origin_user
+    assert seeded.chat_type == "group"
+    mirror.assert_called_once()
