@@ -613,6 +613,23 @@ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool
         return False
 
 
+def _cron_mirror_delivery_scope(cfg: Optional[dict] = None) -> str:
+    """Return the continuable-delivery scope: ``origin`` or ``target``.
+
+    ``origin`` preserves the historical privacy boundary. ``target`` is an
+    explicit operator opt-in for conversational workflows: every successful
+    delivery is attached to the session at the actual destination, including
+    explicit, home-channel, and fan-out targets.
+    """
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        raw = str((cfg.get("cron", {}) or {}).get("mirror_delivery_scope", "origin"))
+        return "target" if raw.strip().lower() == "target" else "origin"
+    except Exception:
+        return "origin"
+
+
 def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
                            thread_id: Optional[str]) -> bool:
     """True when a delivery target is the job's own origin conversation.
@@ -1473,8 +1490,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_scope = _cron_mirror_delivery_scope(user_cfg)
     except Exception:
         mirror_enabled = False
+        mirror_scope = "origin"
     mirror_text = ""
     if mirror_enabled:
         _, mirror_text = BasePlatformAdapter.extract_media(content)
@@ -1509,11 +1528,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job["id"], platform_name, chat_id, thread_id,
             )
 
-        # Mirror is scoped to the ORIGIN conversation only. A fan-out / broadcast
-        # / home-channel-fallback target is never mirrored (it is not the
-        # conversation the job was created in, and may have no session at all).
-        mirror_this_target = mirror_enabled and _target_matches_origin(
-            origin, platform_name, chat_id, thread_id
+        # Default scope remains the creation origin. Operators that explicitly
+        # choose ``target`` get a stronger conversational contract: every
+        # successful delivery is continuable at the actual destination.
+        mirror_this_target = mirror_enabled and (
+            mirror_scope == "target"
+            or _target_matches_origin(origin, platform_name, chat_id, thread_id)
         )
         # Pass the origin's user_id so a per-user-isolated group chat resolves to
         # the exact member who scheduled the job — parity with send_message.
@@ -1581,8 +1601,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # everything else as ``group`` (shared channel). ``inchannel_seeded``
         # suppresses the generic mirror below so the brief is not double-written.
         origin_chat_type = str(origin.get("chat_type") or "").lower()
-        is_dm_target = origin_chat_type == "dm" or (
-            not origin_chat_type and str(chat_id).startswith("D")
+        target_id = str(chat_id)
+        is_whatsapp_group = (
+            platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
+            and target_id.endswith("@g.us")
+        )
+        is_dm_target = (
+            origin_chat_type == "dm"
+            or (not origin_chat_type and target_id.startswith("D"))
+            or (
+                platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
+                and not is_whatsapp_group
+            )
         )
         inchannel_seeded = False
 
@@ -1861,11 +1891,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
-                    # in_channel surface: CREATE + seed the flat channel/DM
-                    # session (the shipped mirror only appends to an existing
-                    # session — the flat row is otherwise absent for a
-                    # chat_postMessage delivery, so the brief would be lost).
-                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                    # Continuable flat surface: CREATE + seed the channel/DM
+                    # session. Target scope does this for DM-only platforms too,
+                    # eliminating the cold-start miss where mirror_to_session had
+                    # no row to append to.
+                    if (
+                        mirror_this_target
+                        and not thread_seeded
+                        and not thread_id
+                        and (in_channel_surface or mirror_scope == "target")
+                    ):
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
@@ -2682,14 +2717,12 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
-    # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
+    # Bind cron identity task-locally. A process-global environment flag leaks
+    # into concurrent interactive gateway turns and silently grants cron approval
+    # policy to the wrong session.
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+
+    _cron_identity_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3327,6 +3360,7 @@ def run_job(
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        _VAR_MAP["HERMES_CRON_SESSION"].reset(_cron_identity_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
