@@ -1430,6 +1430,100 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _is_dm_delivery_target(
+    origin: dict,
+    platform_name: str,
+    chat_id: Any,
+    runtime_adapter: Any,
+    loop: Any,
+    job_id: str,
+    thread_id: Any = None,
+) -> bool:
+    """Best-effort classification for a target-scoped continuation session.
+
+    Origin metadata is authoritative only for the same platform/chat. For an
+    explicit different target, prefer the live adapter's chat metadata, then
+    fall back to stable platform ID conventions. Unknowns fail safe to a group
+    session; classification must never prevent the actual delivery.
+    """
+    dm_types = {"dm", "direct", "private"}
+    group_types = {"group", "channel", "supergroup", "guild"}
+    target_platform = str(platform_name).lower()
+    target_id = str(chat_id)
+
+    same_as_origin = (
+        str(origin.get("platform") or "").lower() == target_platform
+        and str(origin.get("chat_id") or "") == target_id
+    )
+    if same_as_origin:
+        origin_type = str(origin.get("chat_type") or "").strip().lower()
+        if origin_type in dm_types:
+            return True
+        if origin_type in group_types:
+            return False
+
+    # WhatsApp group IDs are authoritative. In particular, the Cloud adapter's
+    # chat-info method cannot query group metadata and intentionally reports DM,
+    # so allowing that probe to win would seed a group under the wrong key.
+    if target_platform in {"whatsapp", "whatsapp_cloud"} and target_id.endswith("@g.us"):
+        return False
+
+    # Resolve on the class so MagicMock instances cannot invent a probe. Keep
+    # the metadata lookup bounded and best-effort, matching the existing
+    # Telegram chat-info probe in this module. Ambiguous Telegram topics already
+    # perform one authoritative probe later for routing, so do not duplicate it.
+    has_separate_telegram_probe = (
+        target_platform == "telegram" and thread_id is not None
+    )
+    get_chat_info = (
+        getattr(type(runtime_adapter), "get_chat_info", None)
+        if (
+            runtime_adapter is not None
+            and loop is not None
+            and not has_separate_telegram_probe
+        )
+        else None
+    )
+    if callable(get_chat_info):
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                get_chat_info(runtime_adapter, target_id), loop,  # type: ignore[arg-type]
+            )
+            if future is not None:
+                info = future.result(timeout=5)
+                chat_type = (
+                    str(info.get("type") or "").strip().lower()
+                    if isinstance(info, dict)
+                    else ""
+                )
+                if chat_type in dm_types:
+                    return True
+                if chat_type in group_types:
+                    return False
+        except Exception:
+            logger.debug(
+                "Job '%s': get_chat_info probe failed for %s:%s while "
+                "classifying continuation target",
+                job_id, platform_name, chat_id, exc_info=True,
+            )
+
+    # Deterministic conventions used by the shipped adapters. These remain
+    # useful for standalone delivery and as a non-blocking probe fallback.
+    if target_platform == "slack":
+        return target_id.startswith("D")
+    if target_platform in {"whatsapp", "whatsapp_cloud"}:
+        return not target_id.endswith("@g.us")
+    if target_platform in {"signal", "yuanbao"}:
+        return not target_id.startswith("group:")
+    if target_platform == "weixin":
+        return not target_id.endswith("@chatroom")
+    if target_platform == "bluebubbles":
+        return ";+;" not in target_id
+    return False
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1607,23 +1701,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # explicitly below (the shipped mirror only APPENDS to an existing
         # session, and the flat channel row is otherwise absent for a
         # chat_postMessage delivery). ``is_dm`` selects the session chat_type so
-        # the seeded key matches the inbound reply's key: a 1:1 DM keys as
-        # ``dm`` (Slack DM channel ids start with "D"; or the origin says so),
-        # everything else as ``group`` (shared channel). ``inchannel_seeded``
+        # the seeded key matches the inbound reply's key. Origin chat_type is
+        # used only for that exact platform/chat; otherwise the live adapter's
+        # bounded get_chat_info probe and stable platform ID conventions
+        # distinguish 1:1 DMs from shared groups/channels. ``inchannel_seeded``
         # suppresses the generic mirror below so the brief is not double-written.
-        origin_chat_type = str(origin.get("chat_type") or "").lower()
-        target_id = str(chat_id)
-        is_whatsapp_group = (
-            platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
-            and target_id.endswith("@g.us")
-        )
         is_dm_target = (
-            origin_chat_type == "dm"
-            or (not origin_chat_type and target_id.startswith("D"))
-            or (
-                platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
-                and not is_whatsapp_group
+            _is_dm_delivery_target(
+                origin, platform_name, chat_id, runtime_adapter, loop,
+                job.get("id", "?"), thread_id,
             )
+            if mirror_this_target
+            else False
         )
         inchannel_seeded = False
 
