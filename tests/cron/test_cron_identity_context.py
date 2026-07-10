@@ -140,3 +140,123 @@ def test_run_job_binds_cron_identity_without_mutating_process_env(tmp_path, monk
     assert final_response == "ok"
     assert seen == {"inside": True, "process_env": None}
     assert os.getenv("HERMES_CRON_SESSION") is None
+
+
+def test_real_run_job_does_not_downgrade_concurrent_gateway_approval_context(
+    tmp_path, monkeypatch
+):
+    """Exercise the public scheduler and approval boundary concurrently.
+
+    The historical implementation set ``HERMES_CRON_SESSION`` process-wide.
+    While a cron agent was running, an unrelated WhatsApp turn therefore looked
+    like cron and skipped the interactive gateway approval path.
+    """
+    from cron.scheduler import run_job
+    import gateway.session_context as session_context
+    from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+    from tools.approval import _is_gateway_approval_context
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.setattr(session_context, "_session_context_engaged", False)
+    cron_entered = threading.Event()
+    release_cron = threading.Event()
+    result = {}
+
+    class BlockingAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_conversation(self, *args, **kwargs):
+            from utils import env_var_enabled
+
+            result["cron_inside"] = env_var_enabled("HERMES_CRON_SESSION")
+            cron_entered.set()
+            assert release_cron.wait(timeout=5)
+            return {"final_response": "ok"}
+
+    job = {
+        "id": "concurrent-identity-job",
+        "name": "concurrent identity",
+        "prompt": "hello",
+        "deliver": "local",
+    }
+    fake_db = MagicMock()
+    gateway_tokens = set_session_vars(platform="whatsapp", chat_id="owner-chat")
+    try:
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "provider": "openrouter",
+                     "api_key": "x",
+                     "base_url": "https://example.invalid",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent", BlockingAgent):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(run_job, job)
+                assert cron_entered.wait(timeout=5)
+                result["interactive_gateway"] = _is_gateway_approval_context()
+                release_cron.set()
+                success, _output, _response, error = future.result(timeout=10)
+    finally:
+        release_cron.set()
+        clear_session_vars(gateway_tokens)
+        reset_session_vars()
+
+    assert success is True
+    assert error is None
+    assert result == {"cron_inside": True, "interactive_gateway": True}
+    assert os.getenv("HERMES_CRON_SESSION") is None
+
+
+def test_run_job_exception_cleans_cron_identity(tmp_path, monkeypatch):
+    from cron.scheduler import run_job
+    from utils import env_var_enabled
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    fake_db = MagicMock()
+
+    class FailingAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_conversation(self, *args, **kwargs):
+            assert env_var_enabled("HERMES_CRON_SESSION") is True
+            raise RuntimeError("deterministic test failure")
+
+    job = {
+        "id": "failing-identity-job",
+        "name": "failing identity",
+        "prompt": "hello",
+        "deliver": "local",
+    }
+
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_state.SessionDB", return_value=fake_db), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value={
+                 "provider": "openrouter",
+                 "api_key": "x",
+                 "base_url": "https://example.invalid",
+                 "api_mode": "chat_completions",
+             },
+         ), \
+         patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+         patch("run_agent.AIAgent", FailingAgent):
+        success, _output, _response, error = run_job(job)
+
+    assert success is False
+    assert "deterministic test failure" in str(error)
+    assert env_var_enabled("HERMES_CRON_SESSION") is False
+    assert os.getenv("HERMES_CRON_SESSION") is None
