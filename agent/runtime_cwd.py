@@ -29,6 +29,11 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
+def reset_session_cwd(token: Token) -> None:
+    """Restore the logical cwd value that preceded ``set_session_cwd``."""
+    _SESSION_CWD.reset(token)
+
+
 def _session_cwd_override() -> str:
     value = _SESSION_CWD.get()
     if value is _UNSET:
