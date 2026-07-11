@@ -20,6 +20,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -535,6 +538,72 @@ def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     return False
 
 
+_WHATSAPP_TRANSIENT_DELIVERY_PATTERNS = (
+    "not connected to whatsapp",
+    "connection closed",
+    "connection reset",
+    "econnreset",
+    "socket hang up",
+    "timed out",
+    "timeout",
+)
+
+_WHATSAPP_FATAL_DELIVERY_PATTERNS = (
+    "device_removed",
+    "logged out",
+    "logout",
+    "qr",
+    "reauth",
+    "re-auth",
+    "unauthorized",
+    "forbidden",
+    "403",
+    "restricted_all_companions",
+)
+
+
+def _is_whatsapp_platform(platform: object) -> bool:
+    value = getattr(platform, "value", platform)
+    return str(value).lower() == "whatsapp"
+
+
+def _is_transient_whatsapp_delivery_error(error: object) -> bool:
+    """Return True for short-lived WhatsApp/Baileys transport errors.
+
+    Cron deliveries should retry transport flaps like ``Connection Closed`` or
+    ``Not connected to WhatsApp``.  Auth/session failures must still fail fast:
+    retry loops cannot fix QR/reauth/device-removed states and only create noise.
+    """
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if any(pattern in text for pattern in _WHATSAPP_FATAL_DELIVERY_PATTERNS):
+        return False
+    return any(pattern in text for pattern in _WHATSAPP_TRANSIENT_DELIVERY_PATTERNS)
+
+
+def _wait_for_whatsapp_bridge_connected(timeout_s: float) -> bool:
+    """Wait briefly for the local WhatsApp bridge to report connected.
+
+    Best-effort only.  If the health endpoint is unavailable we still allow the
+    caller to retry the send after the bounded delay; the final delivery result
+    remains authoritative.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_probe_had_response = False
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=2) as response:  # noqa: S310 - local bridge health
+                payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            last_probe_had_response = True
+            if str(payload.get("status") or "").lower() == "connected":
+                return True
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        time.sleep(1)
+    return False if last_probe_had_response else True
+
+
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -610,6 +679,23 @@ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool
         return bool((cfg.get("cron", {}) or {}).get("mirror_delivery", False))
     except Exception:
         return False
+
+
+def _cron_mirror_delivery_scope(cfg: Optional[dict] = None) -> str:
+    """Return the continuable-delivery scope: ``origin`` or ``target``.
+
+    ``origin`` preserves the historical privacy boundary. ``target`` is an
+    explicit operator opt-in for conversational workflows: every successful
+    delivery is attached to the session at the actual destination, including
+    explicit, home-channel, and fan-out targets.
+    """
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        raw = str((cfg.get("cron", {}) or {}).get("mirror_delivery_scope", "origin"))
+        return "target" if raw.strip().lower() == "target" else "origin"
+    except Exception:
+        return "origin"
 
 
 def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
@@ -1472,8 +1558,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_scope = _cron_mirror_delivery_scope(user_cfg)
     except Exception:
         mirror_enabled = False
+        mirror_scope = "origin"
     mirror_text = ""
     if mirror_enabled:
         _, mirror_text = BasePlatformAdapter.extract_media(content)
@@ -1508,11 +1596,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job["id"], platform_name, chat_id, thread_id,
             )
 
-        # Mirror is scoped to the ORIGIN conversation only. A fan-out / broadcast
-        # / home-channel-fallback target is never mirrored (it is not the
-        # conversation the job was created in, and may have no session at all).
-        mirror_this_target = mirror_enabled and _target_matches_origin(
-            origin, platform_name, chat_id, thread_id
+        # Default scope remains the creation origin. Operators that explicitly
+        # choose ``target`` get a stronger conversational contract: every
+        # successful delivery is continuable at the actual destination.
+        mirror_this_target = mirror_enabled and (
+            mirror_scope == "target"
+            or _target_matches_origin(origin, platform_name, chat_id, thread_id)
         )
         # Pass the origin's user_id so a per-user-isolated group chat resolves to
         # the exact member who scheduled the job — parity with send_message.
@@ -1580,8 +1669,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # everything else as ``group`` (shared channel). ``inchannel_seeded``
         # suppresses the generic mirror below so the brief is not double-written.
         origin_chat_type = str(origin.get("chat_type") or "").lower()
-        is_dm_target = origin_chat_type == "dm" or (
-            not origin_chat_type and str(chat_id).startswith("D")
+        target_id = str(chat_id)
+        is_whatsapp_group = (
+            platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
+            and target_id.endswith("@g.us")
+        )
+        is_dm_target = (
+            origin_chat_type == "dm"
+            or (not origin_chat_type and target_id.startswith("D"))
+            or (
+                platform_name.lower() in {"whatsapp", "whatsapp_cloud"}
+                and not is_whatsapp_group
+            )
         )
         inchannel_seeded = False
 
@@ -1860,11 +1959,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
-                    # in_channel surface: CREATE + seed the flat channel/DM
-                    # session (the shipped mirror only appends to an existing
-                    # session — the flat row is otherwise absent for a
-                    # chat_postMessage delivery, so the brief would be lost).
-                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                    # Continuable flat surface: CREATE + seed the channel/DM
+                    # session. Target scope does this for DM-only platforms too,
+                    # eliminating the cold-start miss where mirror_to_session had
+                    # no row to append to.
+                    if (
+                        mirror_this_target
+                        and not thread_seeded
+                        and not thread_id
+                        and (in_channel_surface or mirror_scope == "target")
+                    ):
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
@@ -1954,11 +2058,89 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                target_errors.extend([msg])
-                delivery_errors.extend(target_errors)
-                continue
+                result_error = result.get("error")
+                if _is_whatsapp_platform(platform) and _is_transient_whatsapp_delivery_error(result_error):
+                    for retry_delay in (5, 15, 45):
+                        logger.warning(
+                            "Job '%s': transient WhatsApp delivery error for %s:%s (%s); "
+                            "waiting up to %ss before retrying standalone delivery",
+                            job["id"], platform_name, chat_id, result_error, retry_delay,
+                        )
+                        wait_started = time.monotonic()
+                        _wait_for_whatsapp_bridge_connected(retry_delay)
+                        # A bridge can report "connected" while the underlying
+                        # Baileys socket is still settling after a close. Keep a
+                        # tiny floor so retries are not three immediate replays.
+                        min_backoff = min(2.0, float(retry_delay))
+                        elapsed = time.monotonic() - wait_started
+                        if elapsed < min_backoff:
+                            time.sleep(min_backoff - elapsed)
+                        retry_coro = _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            cleaned_delivery_content,
+                            thread_id=thread_id,
+                            media_files=media_files,
+                        )
+                        try:
+                            result = asyncio.run(retry_coro)
+                        except RuntimeError as run_err:
+                            retry_coro.close()
+                            if _interpreter_shutting_down(run_err):
+                                msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                target_errors.append(msg)
+                                delivery_errors.extend(target_errors)
+                                break
+                            try:
+                                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                                try:
+                                    future = pool.submit(
+                                        asyncio.run,
+                                        _send_to_platform(
+                                            platform,
+                                            pconfig,
+                                            chat_id,
+                                            cleaned_delivery_content,
+                                            thread_id=thread_id,
+                                            media_files=media_files,
+                                        ),
+                                    )
+                                    result = future.result(timeout=30)
+                                finally:
+                                    pool.shutdown(wait=False)
+                            except Exception as e:
+                                if _interpreter_shutting_down(e):
+                                    msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    target_errors.append(msg)
+                                    delivery_errors.extend(target_errors)
+                                    break
+                                msg = f"delivery retry to {platform_name}:{chat_id} failed: {e}"
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                result = {"error": str(e)}
+                        except Exception as e:
+                            msg = f"delivery retry to {platform_name}:{chat_id} failed: {e}"
+                            logger.warning("Job '%s': %s", job["id"], msg)
+                            result = {"error": str(e)}
+
+                        if not (result and result.get("error")):
+                            logger.info(
+                                "Job '%s': transient WhatsApp delivery retry succeeded for %s:%s",
+                                job["id"], platform_name, chat_id,
+                            )
+                            break
+                        result_error = result.get("error")
+                        if not _is_transient_whatsapp_delivery_error(result_error):
+                            break
+
+                if result and result.get("error"):
+                    msg = f"delivery error: {result['error']}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    target_errors.extend([msg])
+                    delivery_errors.extend(target_errors)
+                    continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
@@ -2680,14 +2862,12 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
-    # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
+    # Bind cron identity task-locally. A process-global environment flag leaks
+    # into concurrent interactive gateway turns and silently grants cron approval
+    # policy to the wrong session.
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+
+    _cron_identity_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3283,6 +3463,7 @@ def run_job(
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        _VAR_MAP["HERMES_CRON_SESSION"].reset(_cron_identity_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

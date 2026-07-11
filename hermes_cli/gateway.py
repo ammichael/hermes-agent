@@ -3893,7 +3893,10 @@ def generate_launchd_plist() -> str:
     
     <key>KeepAlive</key>
     <true/>
-    
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
@@ -4605,7 +4608,7 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     print("  Use 'hermes gateway restart' to replace it,")
     print("  or 'hermes gateway stop' first.")
     print("  Or use 'hermes gateway run --replace' to auto-replace.")
-    sys.exit(1)
+    sys.exit(0)
 
 
 def _guard_official_docker_root_gateway() -> None:

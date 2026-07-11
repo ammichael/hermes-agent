@@ -42,7 +42,7 @@ import {
     messageStore: store,
   });
 
-  assert.deepEqual(content, { text: 'reply text' });
+  assert.deepEqual(content, { text: 'reply text', linkPreview: null });
   assert.equal(options.quoted.key.id, 'inbound-1');
   assert.equal(options.quoted.message.conversation, 'original text');
   console.log('  ✓ text replies include Baileys quoted message when resolvable');
@@ -56,7 +56,7 @@ import {
     messageStore: store,
   });
 
-  assert.deepEqual(content, { text: 'plain text' });
+  assert.deepEqual(content, { text: 'plain text', linkPreview: null });
   assert.deepEqual(options, {});
   console.log('  ✓ unresolved replyTo falls back to plain text');
 }

@@ -158,7 +158,7 @@ export function pollUpdateForAggregation({
 }
 
 export function buildTextSendPayload(text, { replyTo, messageStore } = {}) {
-  const content = { text };
+  const content = { text, linkPreview: null };
   const options = {};
   const quoted = messageStore?.get(replyTo);
   if (quoted?.key && quoted?.message) {

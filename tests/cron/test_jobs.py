@@ -20,6 +20,7 @@ from cron.jobs import (
     mark_job_run,
     advance_next_run,
     claim_dispatch,
+    heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
 )
@@ -1573,6 +1574,27 @@ class TestClaimDispatch:
         assert load_jobs()[0]["repeat"]["completed"] == 1
         mark_job_run("os1", success=True)
         assert load_jobs() == []  # completed once, removed — not fired twice
+
+    def test_heartbeat_run_claim_refreshes_existing_one_shot_claim(self, tmp_cron_dir, monkeypatch):
+        t0 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(minutes=3)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "run_claim": {"at": t0.isoformat(), "by": "worker-a"},
+        }])
+
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: t1)
+
+        assert heartbeat_run_claim("os1") is True
+        assert load_jobs()[0]["run_claim"] == {
+            "at": t1.isoformat(),
+            "by": "worker-a",
+        }
+
+    def test_heartbeat_run_claim_without_claim_returns_false(self, tmp_cron_dir):
+        save_jobs([self._oneshot(times=1, completed=0)])
+
+        assert heartbeat_run_claim("os1") is False
 
     def test_mark_job_run_still_increments_recurring(self, tmp_cron_dir):
         # The double-count guard is one-shot-specific; recurring jobs keep the

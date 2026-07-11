@@ -527,6 +527,29 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
     }
+    extra_env_keys = {
+        "embeddings_provider": "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+        "embeddings_openai_api_key": "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
+        "embeddings_openai_model": "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL",
+        "embeddings_openai_base_url": "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL",
+        "embeddings_openai_dimensions": "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS",
+        "reranker_provider": "HINDSIGHT_API_RERANKER_PROVIDER",
+        # Local Gemma/Ollama can extract retained facts acceptably but has been
+        # observed to fail Hindsight's structured consolidation JSON repeatedly.
+        # Surface these daemon toggles through config so reliability fixes do not
+        # get lost when Hermes regenerates the embedded profile env.
+        "enable_observations": "HINDSIGHT_API_ENABLE_OBSERVATIONS",
+        "enable_auto_consolidation": "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION",
+        "worker_max_slots": "HINDSIGHT_API_WORKER_MAX_SLOTS",
+        "worker_consolidation_max_slots": "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+        "worker_retain_max_slots": "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
+        "worker_file_convert_retain_max_slots": "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS",
+        "llm_strict_schema": "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+    }
+    for config_key, env_key in extra_env_keys.items():
+        value = config.get(config_key)
+        if value is not None and value != "":
+            env_values[env_key] = str(value)
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
@@ -1050,6 +1073,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._idle_timeout = idle_timeout
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
+                # HindsightEmbedded only accepts a narrow constructor surface, but
+                # the daemon supports additional operational env toggles. Merge the
+                # profile env derived from config into the embedded client's daemon
+                # config before the first request starts the daemon; otherwise
+                # local reliability settings (e.g. disabling observation
+                # consolidation on Ollama/Gemma) are written to disk but not
+                # present in the actual daemon process.
+                embedded_env = _build_embedded_profile_env(
+                    self._config or {},
+                    llm_api_key=kwargs.get("llm_api_key") or None,
+                )
+                self._client.config.update(embedded_env)
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
@@ -1717,8 +1752,17 @@ class HindsightMemoryProvider(MemoryProvider):
                 item.pop("retain_async", None)
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
+                # Keep the explicit tool aligned with automatic retain: by default
+                # Hindsight should enqueue extraction server-side instead of blocking
+                # the live chat turn until local LLM fact extraction/consolidation
+                # finishes. A synchronous manual retain can otherwise make WhatsApp
+                # look hung when the embedded daemon/Ollama path is slow or retrying.
                 self._run_hindsight_operation(
-                    lambda client: client.aretain_batch(bank_id=self._bank_id, items=[item])
+                    lambda client: client.aretain_batch(
+                        bank_id=self._bank_id,
+                        items=[item],
+                        retain_async=self._retain_async,
+                    )
                 )
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})

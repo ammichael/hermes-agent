@@ -1784,6 +1784,82 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _maybe_spawn_launchd_kickstart_safeguard(exit_code: int) -> None:
+    """Spawn a detached safety-net process that kicks launchd into relaunching
+    the gateway service after we exit.
+
+    On macOS, launchd's ``KeepAlive`` can fail to relaunch after a non-zero
+    exit when a concurrent ``bootout/bootstrap`` cycle (from plist refresh)
+    has unregistered the service, or when internal throttling delays relaunch
+    beyond the 10s ``ThrottleInterval`` default.  This safety net waits 8s
+    (enough for the process to fully exit and launchd to settle), then checks
+    whether a new gateway process has appeared.  If not, it runs ``launchctl
+    bootstrap`` (in case the service was unloaded) followed by ``kickstart``
+    to force the relaunch.
+
+    Only fires on macOS, only for restart-exit-codes (75).  The detached
+    process is ``start_new_session=True`` so it survives our exit.  If a new
+    gateway starts on its own before the 8s elapse, the kickstart is a no-op
+    (it just kills the already-running process and starts a new one, which is
+    harmless — but we skip it by checking ``launchctl list`` first).
+
+    See #43842, #44515, and the 2026-06-26 / 2026-07-08 restart incidents.
+    """
+    import sys
+    if sys.platform != "darwin":
+        return
+    if exit_code != GATEWAY_SERVICE_RESTART_EXIT_CODE:
+        return
+    try:
+        import shlex
+        import subprocess
+        from hermes_constants import get_hermes_home
+        hermes_home = get_hermes_home()
+        profile = os.environ.get("HERMES_PROFILE", "")
+        label = f"ai.hermes.gateway-{profile}" if profile else "ai.hermes.gateway"
+        uid = os.getuid()
+        domain = f"gui/{uid}"
+        target = f"{domain}/{label}"
+        plist_path = hermes_home.parent / "LaunchAgents" / f"{label}.plist"
+        if not plist_path.exists():
+            # Try the standard location
+            plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if not plist_path.exists():
+            logger.warning(
+                "Launchd kickstart safeguard: plist not found at %s — skipping",
+                plist_path,
+            )
+            return
+        safeguard_log = hermes_home / "logs" / "launchd-kickstart-safeguard.log"
+        script = (
+            f"sleep 8; "
+            # Check if launchd already relaunched us — look for the label in
+            # launchctl list output and check it has a PID (running process).
+            f"if launchctl list {shlex.quote(label)} 2>/dev/null | grep -q 'PID'; then "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] safeguard: gateway already relaunched — no action needed\" >> {shlex.quote(str(safeguard_log))}; "
+            f"  exit 0; "
+            f"fi; "
+            # Ensure the service is registered (bootstrap is no-op if already loaded).
+            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
+            # Force-start the service.
+            f"launchctl kickstart {shlex.quote(target)} 2>/dev/null; "
+            f"echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] safeguard: fired launchd kickstart for {shlex.quote(target)}\" >> {shlex.quote(str(safeguard_log))}; "
+        )
+        subprocess.Popen(
+            ["/bin/bash", "-c", script],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(
+            "Spawned launchd kickstart safeguard (detached, fires in 8s if "
+            "KeepAlive did not relaunch the gateway)"
+        )
+    except Exception as exc:
+        # Best-effort — never block the exit path.
+        logger.warning("Failed to spawn launchd kickstart safeguard: %s", exc)
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -20635,6 +20711,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         pass
 
     if runner.exit_code is not None:
+        _maybe_spawn_launchd_kickstart_safeguard(runner.exit_code)
         raise SystemExit(runner.exit_code)
 
     # When an unexpected SIGTERM caused the shutdown and it wasn't a planned
@@ -20659,6 +20736,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Exiting with code 75 (service-restart requested) so the service "
             "manager relaunches the gateway."
         )
+        _maybe_spawn_launchd_kickstart_safeguard(GATEWAY_SERVICE_RESTART_EXIT_CODE)
         raise SystemExit(75)
 
     return True

@@ -224,6 +224,17 @@ def _job_output_dir(job_id: str) -> Path:
     return OUTPUT_DIR / text
 
 
+def get_cron_output_dir(job_id: str) -> Path:
+    """Compatibility wrapper for older scheduler/tooling code.
+
+    Some long-lived gateway processes can keep an older ``cron.scheduler`` module
+    in memory while ``cron.jobs`` has already been updated on disk.  Preserve the
+    old public helper name so context-from output lookup keeps using the same
+    path-safety checks instead of failing the whole cron run.
+    """
+    return _job_output_dir(job_id)
+
+
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
     if skills is None:
@@ -1484,6 +1495,31 @@ def claim_dispatch(job_id: str) -> bool:
             job_id,
         )
         return True
+
+
+def heartbeat_run_claim(job_id: str) -> bool:
+    """Refresh the timestamp for an in-flight one-shot run claim.
+
+    Long one-shot prompts can legitimately run longer than the stale-claim TTL
+    as long as they keep producing output.  The scheduler calls this heartbeat
+    while the run is still active so another ticker does not recover and
+    re-dispatch the same one-shot mid-run.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if not claim:
+                return False
+            by = claim.get("by") if isinstance(claim, dict) else None
+            job["run_claim"] = {"at": _hermes_now().isoformat(), "by": by or _machine_id()}
+            save_jobs(jobs)
+            return True
+        return False
 
 
 def advance_next_run(job_id: str) -> bool:

@@ -31,7 +31,19 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 
 
 def env_var_enabled(name: str, default: str = "") -> bool:
-    """Return True when an environment variable is set to a truthy value."""
+    """Return True when an environment/session variable is truthy.
+
+    Session-scoped variables use ContextVars in concurrent gateway/cron hosts.
+    Reading them from ``os.environ`` would reintroduce the cross-session identity
+    leak that the session-context layer exists to prevent.
+    """
+    try:
+        from gateway.session_context import _VAR_MAP, get_session_env
+
+        if name in _VAR_MAP:
+            return is_truthy_value(get_session_env(name, default), default=False)
+    except Exception:
+        pass
     return is_truthy_value(os.getenv(name, default), default=False)
 
 
