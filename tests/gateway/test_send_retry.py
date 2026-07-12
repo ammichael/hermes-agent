@@ -81,6 +81,14 @@ class TestIsRetryableError:
     def test_connect_timeout_is_retryable(self):
         assert _StubAdapter._is_retryable_error("ConnectTimeout: connection timed out")
 
+    @pytest.mark.parametrize("error", [
+        "[Errno 54] Connection reset by peer",
+        "Server disconnected",
+        "httpx.RemoteProtocolError: Server disconnected without sending a response.",
+    ])
+    def test_platform_disconnect_phrases_are_retryable(self, error):
+        assert _StubAdapter._is_retryable_error(error)
+
 
 # ---------------------------------------------------------------------------
 # _is_timeout_error
@@ -147,6 +155,19 @@ class TestSendWithRetryNetworkRetry:
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
         assert result.success
         assert len(adapter._send_calls) == 2  # initial + 1 retry
+
+    @pytest.mark.asyncio
+    async def test_retries_platform_disconnect_instead_of_plaintext_fallback(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="Server disconnected"),
+            SendResult(success=True, message_id="ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "**hello**", max_retries=2, base_delay=0)
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        assert not any("plain text" in content.lower() for _, content in adapter._send_calls)
 
     @pytest.mark.asyncio
     async def test_timeout_not_retried_to_prevent_duplicates(self):

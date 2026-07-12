@@ -2134,11 +2134,13 @@ _RETRYABLE_ERROR_PATTERNS = (
     "connecterror",
     "connectionerror",
     "connectionreset",
+    "connection reset",
     "connectionrefused",
     "connecttimeout",
     "network",
     "broken pipe",
     "remotedisconnected",
+    "server disconnected",
     "eoferror",
 )
 
