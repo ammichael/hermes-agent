@@ -484,6 +484,11 @@ class CLIAgentSetupMixin:
             if resolved_meta:
                 session_meta = resolved_meta
 
+        if session_meta.get("title"):
+            sync_title = getattr(self, "_sync_terminal_session_title", None)
+            if sync_title:
+                sync_title(session_meta["title"])
+
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]

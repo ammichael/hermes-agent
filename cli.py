@@ -3681,6 +3681,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     Provides a REPL interface with rich formatting, command history,
     and tool execution capabilities.
     """
+
+    def _sync_terminal_session_title(
+        self,
+        title: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> bool:
+        """Best-effort title sync scoped to this CLI's controlling terminal.
+
+        ``expected_session_id`` closes the race where asynchronous auto-title
+        generation finishes after the user has already switched sessions.
+        """
+        if expected_session_id and expected_session_id != self.session_id:
+            return False
+        try:
+            from hermes_cli.terminal_title import set_terminal_title
+
+            return set_terminal_title(title)
+        except Exception:
+            return False
     
     def __init__(
         self,
@@ -7154,6 +7174,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 pass
             self._notify_session_boundary("on_session_reset")
 
+        self._sync_terminal_session_title(title or "Nova Sessão Hermes")
+
         if not silent:
             if title:
                 print(f"(^_^)v New session started: {title}")
@@ -8581,6 +8603,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             # Session exists in DB — set title directly
                             try:
                                 if self._session_db.set_session_title(self.session_id, new_title):
+                                    self._sync_terminal_session_title(new_title)
                                     _cprint(f"  Session title set: {new_title}")
                                 else:
                                     _cprint("  Session not found in database.")
@@ -8594,6 +8617,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                 _cprint(f"  Title '{new_title}' is already in use by session {existing['id']}")
                             else:
                                 self._pending_title = new_title
+                                self._sync_terminal_session_title(new_title)
                                 _cprint(f"  Session title queued: {new_title} (will be saved on first message)")
                     else:
                         from hermes_state import format_session_db_unavailable
@@ -12570,9 +12594,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _title_failure_cb = getattr(
                         self.agent, "_emit_auxiliary_failure", None
                     ) if self.agent else None
+                    _auto_title_session_id = self.session_id
+
+                    def _on_auto_title(title: str) -> None:
+                        self._sync_terminal_session_title(
+                            title,
+                            expected_session_id=_auto_title_session_id,
+                        )
+
                     maybe_auto_title(
                         self._session_db,
-                        self.session_id,
+                        _auto_title_session_id,
                         message,
                         response,
                         self.conversation_history,
@@ -12584,6 +12616,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             "api_key": self.api_key,
                             "api_mode": self.api_mode,
                         },
+                        title_callback=_on_auto_title,
                     )
                 except Exception:
                     pass

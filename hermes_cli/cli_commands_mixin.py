@@ -746,6 +746,10 @@ class CLICommandsMixin:
                 session_meta = resolved_meta
 
         if target_id == self.session_id:
+            if session_meta.get("title"):
+                sync_title = getattr(self, "_sync_terminal_session_title", None)
+                if sync_title:
+                    sync_title(session_meta["title"])
             _cprint("  Already on that session.")
             return
 
@@ -811,6 +815,11 @@ class CLICommandsMixin:
                     )
             except Exception:
                 pass
+
+        if session_meta.get("title"):
+            sync_title = getattr(self, "_sync_terminal_session_title", None)
+            if sync_title:
+                sync_title(session_meta["title"])
 
         title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
         msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])

@@ -21,7 +21,7 @@ class TestGenerateTitle:
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             title = generate_title("help me fix this import", "Sure, let me check...")
-            assert title == "Debugging Python Import Errors"
+            assert title == "Debugging Python Import"
 
     def test_default_prompt_matches_user_language(self):
         mock_response = MagicMock()
@@ -32,6 +32,7 @@ class TestGenerateTitle:
             generate_title("質問です", "回答です")
 
         system_prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "EXACTLY 3 words" in system_prompt
         assert "same language the user is writing in" in system_prompt
 
     def test_configured_language_pins_prompt(self):
@@ -66,11 +67,11 @@ class TestGenerateTitle:
             captured_kwargs.update(kwargs)
             resp = MagicMock()
             resp.choices = [MagicMock()]
-            resp.choices[0].message.content = "Configured Timeout"
+            resp.choices[0].message.content = "Configured Timeout Title"
             return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
-            assert generate_title("question", "answer") == "Configured Timeout"
+            assert generate_title("question", "answer") == "Configured Timeout Title"
 
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
@@ -82,11 +83,11 @@ class TestGenerateTitle:
             captured_kwargs.update(kwargs)
             resp = MagicMock()
             resp.choices = [MagicMock()]
-            resp.choices[0].message.content = "Explicit Timeout"
+            resp.choices[0].message.content = "Explicit Timeout Title"
             return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
-            assert generate_title("question", "answer", timeout=123.0) == "Explicit Timeout"
+            assert generate_title("question", "answer", timeout=123.0) == "Explicit Timeout Title"
 
         assert captured_kwargs["timeout"] == 123.0
 
@@ -97,7 +98,7 @@ class TestGenerateTitle:
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             title = generate_title("how do I set up docker", "First install...")
-            assert title == "Setting Up Docker Environment"
+            assert title == "Setting Up Docker"
 
     def test_strips_think_blocks(self):
         """Reasoning-model output wrapped in <think>...</think> must not
@@ -111,7 +112,7 @@ class TestGenerateTitle:
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             title = generate_title("help me fix this import", "Sure...")
-            assert title == "Debugging Python Import Errors"
+            assert title == "Debugging Python Import"
             assert "<think>" not in title
             assert "summarize" not in title
 
@@ -139,15 +140,25 @@ class TestGenerateTitle:
             title = generate_title("my pod keeps crashing", "Let me look...")
             assert title == "Kubernetes Pod Debugging"
 
-    def test_truncates_long_titles(self):
+    def test_enforces_three_bounded_words(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "A" * 100
+        mock_response.choices[0].message.content = (
+            "A" * 100 + " " + "B" * 100 + " " + "C" * 100 + " ignored"
+        )
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             title = generate_title("question", "answer")
-            assert len(title) == 80
-            assert title.endswith("...")
+            assert title == "A" * 24 + " " + "B" * 24 + " " + "C" * 24
+            assert len(title.split()) == 3
+
+    def test_rejects_fewer_than_three_words(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Too Short"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") is None
 
     def test_returns_none_on_empty_response(self):
         mock_response = MagicMock()
@@ -200,7 +211,7 @@ class TestGenerateTitle:
             captured_kwargs.update(kwargs)
             resp = MagicMock()
             resp.choices = [MagicMock()]
-            resp.choices[0].message.content = "Short Title"
+            resp.choices[0].message.content = "Short Useful Title"
             return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):

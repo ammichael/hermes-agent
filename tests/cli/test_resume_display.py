@@ -570,6 +570,7 @@ class TestPreloadResumedSession:
 
     def test_loads_session_successfully(self):
         cli = _make_cli(resume="good_session")
+        cli._sync_terminal_session_title = MagicMock()
         messages = _simple_history()
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
@@ -587,6 +588,7 @@ class TestPreloadResumedSession:
         assert "good_session" in output
         assert "Test Session" in output
         assert "2 user messages" in output
+        cli._sync_terminal_session_title.assert_called_once_with("Test Session")
 
     def test_reopens_session_in_db(self):
         cli = _make_cli(resume="reopen_session")
@@ -639,6 +641,7 @@ class TestHandleResumeCommandRecap:
     def test_resume_command_displays_recap_when_messages_restored(self):
         cli = _make_cli()
         cli.session_id = "current_session"
+        cli._sync_terminal_session_title = MagicMock()
         messages = _simple_history()
 
         mock_db = MagicMock()
@@ -659,6 +662,7 @@ class TestHandleResumeCommandRecap:
         mock_db.end_session.assert_called_once_with("current_session", "resumed_other")
         mock_db.reopen_session.assert_called_once_with("target_session")
         display_mock.assert_called_once_with()
+        cli._sync_terminal_session_title.assert_called_once_with("Test Session")
 
     def test_resume_command_skips_recap_when_session_has_no_messages(self):
         cli = _make_cli()

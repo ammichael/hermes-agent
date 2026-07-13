@@ -13,6 +13,7 @@ def _make_cli():
     cli_obj.agent = None
     cli_obj._session_db = MagicMock()
     cli_obj._pending_resume_sessions = None
+    cli_obj._sync_terminal_session_title = MagicMock()
     # _handle_resume_command now triggers _display_resumed_history (#31695),
     # which reads self.resume_display. "minimal" short-circuits the recap so
     # the test only exercises session-switch behavior.
@@ -21,6 +22,29 @@ def _make_cli():
 
 
 class TestCliResumeCommand:
+    def test_resume_current_session_restores_terminal_title(self):
+        cli_obj = _make_cli()
+        db = MagicMock()
+        db.get_session.return_value = {
+            "id": "current_session",
+            "title": "App Store Estrago",
+        }
+        db.resolve_resume_session_id.return_value = "current_session"
+        cli_obj._session_db = db
+        sync_title = MagicMock()
+        cli_obj._sync_terminal_session_title = sync_title
+
+        with (
+            patch(
+                "hermes_cli.main._resolve_session_by_name_or_id",
+                return_value="current_session",
+            ),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume App Store Estrago")
+
+        sync_title.assert_called_once_with("App Store Estrago")
+
     def test_show_recent_sessions_includes_indexes_and_resume_hint(self, capsys):
         cli_obj = _make_cli()
         cli_obj._list_recent_sessions = MagicMock(return_value=[

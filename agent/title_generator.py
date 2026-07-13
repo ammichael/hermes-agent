@@ -20,18 +20,31 @@ FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
 _TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
+    "Generate a descriptive title of EXACTLY 3 words for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
     "Write the title in the same language the user is writing in. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Prefer concrete nouns over generic words. Return ONLY the three-word title, nothing else. "
+    "No quotes, no punctuation at the end, no prefixes."
 )
 
 _TITLE_PROMPT_PINNED_LANGUAGE = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
+    "Generate a descriptive title of EXACTLY 3 words for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
     "Write the title in {language}. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Prefer concrete nouns over generic words. Return ONLY the three-word title, nothing else. "
+    "No quotes, no punctuation at the end, no prefixes."
 )
+
+_MAX_GENERATED_WORD_CHARS = 24
+
+
+def _normalize_generated_title(title: str) -> Optional[str]:
+    """Enforce the three-word navigation contract independent of model output."""
+    words = title.split()
+    if len(words) < 3:
+        return None
+    bounded = [word[:_MAX_GENERATED_WORD_CHARS] for word in words[:3]]
+    return " ".join(bounded)
 
 
 def _title_language() -> str:
@@ -100,10 +113,7 @@ def generate_title(
         title = title.strip('"\'')
         if title.lower().startswith("title:"):
             title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
-        return title if title else None
+        return _normalize_generated_title(title) if title else None
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
