@@ -31,6 +31,7 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -613,6 +614,23 @@ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool
         return False
 
 
+def _cron_mirror_delivery_scope(cfg: Optional[dict] = None) -> str:
+    """Return the continuable-delivery scope: ``origin`` or ``target``.
+
+    ``origin`` preserves the historical privacy boundary. ``target`` is an
+    explicit operator opt-in for conversational workflows: every successful
+    delivery is attached to the session at the actual destination, including
+    explicit, home-channel, and fan-out targets.
+    """
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        raw = str((cfg.get("cron", {}) or {}).get("mirror_delivery_scope", "origin"))
+        return "target" if raw.strip().lower() == "target" else "origin"
+    except Exception:
+        return "origin"
+
+
 def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
                            thread_id: Optional[str]) -> bool:
     """True when a delivery target is the job's own origin conversation.
@@ -761,7 +779,7 @@ def _seed_cron_thread_session(
     thread_id: str,
     mirror_text: str,
     chat_name: Optional[str] = None,
-) -> None:
+) -> bool:
     """Seed the freshly-opened cron thread's session with the brief.
 
     Without this the brief is *visible* in the new thread but absent from any
@@ -778,12 +796,16 @@ def _seed_cron_thread_session(
     """
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
 
         session_store = getattr(adapter, "_session_store", None)
+        if session_store is None and callable(
+            getattr(adapter, "get_or_create_session", None)
+        ):
+            session_store = adapter
         if session_store is not None:
             try:
                 platform_enum = Platform(platform_name.lower())
@@ -810,7 +832,7 @@ def _seed_cron_thread_session(
         # in-thread reply produces assistant→user→... off a phantom assistant
         # message. Pass the seed user_id so the mirror resolves the exact
         # thread-keyed session row we just created.
-        mirror_to_session(
+        ok = mirror_to_session(
             platform_name,
             str(chat_id),
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
@@ -823,11 +845,13 @@ def _seed_cron_thread_session(
             "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
             job.get("id", "?"), thread_id, platform_name, chat_id,
         )
+        return bool(ok)
     except Exception as e:
         logger.debug(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+        return False
 
 
 def _seed_cron_channel_session(
@@ -883,6 +907,10 @@ def _seed_cron_channel_session(
 
         chat_type = "dm" if is_dm else "group"
         session_store = getattr(adapter, "_session_store", None)
+        if session_store is None and callable(
+            getattr(adapter, "get_or_create_session", None)
+        ):
+            session_store = adapter
         if session_store is not None:
             try:
                 platform_enum = Platform(platform_name.lower())
@@ -1402,6 +1430,102 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _is_dm_delivery_target(
+    origin: dict,
+    platform_name: str,
+    chat_id: Any,
+    runtime_adapter: Any,
+    loop: Any,
+    job_id: str,
+    thread_id: Any = None,
+) -> bool:
+    """Best-effort classification for a target-scoped continuation session.
+
+    Origin metadata is authoritative only for the same platform/chat. For an
+    explicit different target, prefer the live adapter's chat metadata, then
+    fall back to stable platform ID conventions. Unknowns fail safe to a group
+    session; classification must never prevent the actual delivery.
+    """
+    dm_types = {"dm", "direct", "private"}
+    group_types = {"group", "channel", "supergroup", "guild"}
+    target_platform = str(platform_name).lower()
+    target_id = str(chat_id)
+
+    same_as_origin = (
+        str(origin.get("platform") or "").lower() == target_platform
+        and str(origin.get("chat_id") or "") == target_id
+    )
+    if same_as_origin:
+        origin_type = str(origin.get("chat_type") or "").strip().lower()
+        if origin_type in dm_types:
+            return True
+        if origin_type in group_types:
+            return False
+
+    # WhatsApp group IDs are authoritative. In particular, the Cloud adapter's
+    # chat-info method cannot query group metadata and intentionally reports DM,
+    # so allowing that probe to win would seed a group under the wrong key.
+    if target_platform in {"whatsapp", "whatsapp_cloud"} and target_id.endswith("@g.us"):
+        return False
+
+    # Resolve on the class so MagicMock instances cannot invent a probe. Keep
+    # the metadata lookup bounded and best-effort, matching the existing
+    # Telegram chat-info probe in this module. Ambiguous Telegram topics already
+    # perform one authoritative probe later for routing, so do not duplicate it.
+    has_separate_telegram_probe = (
+        target_platform == "telegram" and thread_id is not None
+    )
+    get_chat_info = (
+        getattr(type(runtime_adapter), "get_chat_info", None)
+        if (
+            runtime_adapter is not None
+            and loop is not None
+            and not has_separate_telegram_probe
+        )
+        else None
+    )
+    if callable(get_chat_info):
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                get_chat_info(runtime_adapter, target_id), loop,  # type: ignore[arg-type]
+            )
+            if future is not None:
+                info = future.result(timeout=5)
+                chat_type = (
+                    str(info.get("type") or "").strip().lower()
+                    if isinstance(info, dict)
+                    else ""
+                )
+                if chat_type in dm_types:
+                    return True
+                if chat_type in group_types:
+                    return False
+        except Exception:
+            logger.debug(
+                "Job '%s': get_chat_info probe failed for %s:%s while "
+                "classifying continuation target",
+                job_id, platform_name, chat_id, exc_info=True,
+            )
+
+    # Deterministic conventions used by the shipped adapters. These remain
+    # useful for standalone delivery and as a non-blocking probe fallback.
+    if target_platform == "slack":
+        return target_id.startswith("D")
+    if target_platform in {"whatsapp", "whatsapp_cloud"}:
+        return not target_id.endswith("@g.us")
+    if target_platform in {"signal", "yuanbao"}:
+        return not target_id.startswith("group:")
+    if target_platform == "weixin":
+        return not target_id.endswith("@chatroom")
+    if target_platform == "bluebubbles":
+        return ";+;" not in target_id
+    if target_platform == "matrix":
+        return target_id.startswith("@")
+    return False
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1473,8 +1597,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_scope = _cron_mirror_delivery_scope(user_cfg)
     except Exception:
         mirror_enabled = False
+        mirror_scope = "origin"
     mirror_text = ""
     if mirror_enabled:
         _, mirror_text = BasePlatformAdapter.extract_media(content)
@@ -1509,11 +1635,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job["id"], platform_name, chat_id, thread_id,
             )
 
-        # Mirror is scoped to the ORIGIN conversation only. A fan-out / broadcast
-        # / home-channel-fallback target is never mirrored (it is not the
-        # conversation the job was created in, and may have no session at all).
-        mirror_this_target = mirror_enabled and _target_matches_origin(
-            origin, platform_name, chat_id, thread_id
+        # Default scope remains the creation origin. Operators that explicitly
+        # choose ``target`` get a stronger conversational contract: every
+        # successful delivery is continuable at the actual destination.
+        mirror_this_target = mirror_enabled and (
+            mirror_scope == "target"
+            or _target_matches_origin(origin, platform_name, chat_id, thread_id)
         )
         # Pass the origin's user_id so a per-user-isolated group chat resolves to
         # the exact member who scheduled the job — parity with send_message.
@@ -1576,13 +1703,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # explicitly below (the shipped mirror only APPENDS to an existing
         # session, and the flat channel row is otherwise absent for a
         # chat_postMessage delivery). ``is_dm`` selects the session chat_type so
-        # the seeded key matches the inbound reply's key: a 1:1 DM keys as
-        # ``dm`` (Slack DM channel ids start with "D"; or the origin says so),
-        # everything else as ``group`` (shared channel). ``inchannel_seeded``
+        # the seeded key matches the inbound reply's key. Origin chat_type is
+        # used only for that exact platform/chat; otherwise the live adapter's
+        # bounded get_chat_info probe and stable platform ID conventions
+        # distinguish 1:1 DMs from shared groups/channels. ``inchannel_seeded``
         # suppresses the generic mirror below so the brief is not double-written.
-        origin_chat_type = str(origin.get("chat_type") or "").lower()
-        is_dm_target = origin_chat_type == "dm" or (
-            not origin_chat_type and str(chat_id).startswith("D")
+        is_dm_target = (
+            _is_dm_delivery_target(
+                origin, platform_name, chat_id, runtime_adapter, loop,
+                job.get("id", "?"), thread_id,
+            )
+            if mirror_this_target
+            else False
         )
         inchannel_seeded = False
 
@@ -1861,11 +1993,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
-                    # in_channel surface: CREATE + seed the flat channel/DM
-                    # session (the shipped mirror only appends to an existing
-                    # session — the flat row is otherwise absent for a
-                    # chat_postMessage delivery, so the brief would be lost).
-                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                    # Continuable flat surface: CREATE + seed the channel/DM
+                    # session. Target scope does this for DM-only platforms too,
+                    # eliminating the cold-start miss where mirror_to_session had
+                    # no row to append to.
+                    if (
+                        mirror_this_target
+                        and not thread_seeded
+                        and not thread_id
+                        and (in_channel_surface or mirror_scope == "target")
+                    ):
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
@@ -1962,10 +2099,44 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+
+            # The standalone send bypasses the live adapter branch above, so a
+            # target-scoped mirror must explicitly create the cold destination
+            # row before appending. Reuse a live adapter's store when available;
+            # otherwise construct the same SessionStore used by the gateway.
+            standalone_seeded = False
+            if mirror_this_target and mirror_scope == "target":
+                seed_store = runtime_adapter
+                if seed_store is None or not (
+                    getattr(seed_store, "_session_store", None)
+                    or callable(getattr(seed_store, "get_or_create_session", None))
+                ):
+                    try:
+                        from gateway.session import SessionStore
+
+                        seed_store = SessionStore(config.sessions_dir, config)
+                    except Exception as exc:
+                        seed_store = None
+                        logger.debug(
+                            "Job '%s': standalone cold-session store unavailable: %s",
+                            job.get("id", "?"), exc,
+                        )
+                if seed_store is not None:
+                    if thread_id:
+                        standalone_seeded = _seed_cron_thread_session(
+                            job, seed_store, platform_name, chat_id, str(thread_id),
+                            mirror_text, chat_name=origin.get("chat_name"),
+                        )
+                    else:
+                        standalone_seeded = _seed_cron_channel_session(
+                            job, seed_store, platform_name, chat_id, mirror_text,
+                            is_dm=is_dm_target, user_id=origin_user_id,
+                            chat_name=origin.get("chat_name"),
+                        )
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
-                enabled=mirror_this_target and not thread_seeded,
+                enabled=mirror_this_target and not thread_seeded and not standalone_seeded,
             )
 
     if delivery_errors:
@@ -2482,6 +2653,87 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+@contextmanager
+def _cron_execution_scope(job: dict, job_id: str):
+    """Bind cron/session/CWD state with cleanup covering partial setup."""
+    from gateway.session_context import set_session_vars, restore_session_vars, _VAR_MAP
+
+    cron_identity_token = None
+    ctx_tokens = None
+    cron_delivery_vars = (
+        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    )
+    cron_delivery_tokens = {}
+    job_workdir = None
+    prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    holds_cwd_write = False
+    cwd_lock_acquired = False
+
+    # The first bind belongs inside this try: every subsequent setup operation
+    # can fail, and cleanup must still restore the cron approval boundary.
+    try:
+        cron_identity_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+        ctx_tokens = set_session_vars(platform="", chat_id="", chat_name="")
+        for var_name in cron_delivery_vars:
+            cron_delivery_tokens[var_name] = _VAR_MAP[var_name].set("")
+
+        job_workdir = (job.get("workdir") or "").strip() or None
+        if job_workdir and not Path(job_workdir).is_dir():
+            logger.warning(
+                "Job '%s': configured workdir %r no longer exists — running without it",
+                job_id, job_workdir,
+            )
+            job_workdir = None
+
+        holds_cwd_write = job_workdir is not None
+        if holds_cwd_write:
+            _terminal_cwd_lock.acquire_write()
+        else:
+            _terminal_cwd_lock.acquire_read()
+        cwd_lock_acquired = True
+
+        if job_workdir:
+            os.environ["TERMINAL_CWD"] = job_workdir
+            logger.info("Job '%s': using workdir %s", job_id, job_workdir)
+        yield job_workdir
+    finally:
+        if cwd_lock_acquired:
+            if job_workdir:
+                if prior_terminal_cwd == "_UNSET_":
+                    os.environ.pop("TERMINAL_CWD", None)
+                else:
+                    os.environ["TERMINAL_CWD"] = prior_terminal_cwd
+            try:
+                if holds_cwd_write:
+                    _terminal_cwd_lock.release_write()
+                else:
+                    _terminal_cwd_lock.release_read()
+            except Exception as exc:
+                logger.debug("Job '%s': failed to release cwd lock: %s", job_id, exc)
+
+        if ctx_tokens is not None:
+            try:
+                restore_session_vars(ctx_tokens)
+            except Exception as exc:
+                logger.debug("Job '%s': failed to restore session context: %s", job_id, exc)
+        if cron_identity_token is not None:
+            try:
+                _VAR_MAP["HERMES_CRON_SESSION"].reset(cron_identity_token)
+            except Exception as exc:
+                logger.debug("Job '%s': failed to restore cron identity: %s", job_id, exc)
+        for var_name in reversed(cron_delivery_vars):
+            token = cron_delivery_tokens.get(var_name)
+            if token is not None:
+                try:
+                    _VAR_MAP[var_name].reset(token)
+                except Exception as exc:
+                    logger.debug(
+                        "Job '%s': failed to restore %s: %s", job_id, var_name, exc
+                    )
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2682,48 +2934,31 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
+    # Bind cron/session/CWD state under one stack-safe scope whose cleanup starts
+    # at the first identity bind, including partial setup failures.
+    _cron_scope = _cron_execution_scope(job, job_id)
+    try:
+        _job_workdir = _cron_scope.__enter__()
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.exception("Job '%s' failed during cron context setup: %s", job_name, error_msg)
+        if _session_db:
+            try:
+                _session_db.close()
+            except Exception:
+                pass
+        output = f"""# Cron Job: {job_name} (FAILED)
 
-    # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 
-    # Cron execution is an internal scheduler context, not a live inbound
-    # gateway message. Do not seed HERMES_SESSION_* contextvars from the
-    # stored ``origin`` (which is delivery routing metadata, not a sender
-    # identity). Several tool consumers branch on these vars during job
-    # execution and would otherwise behave as if a real user from the
-    # origin chat was driving the agent:
-    #   - tools/terminal_tool.py: background-process notification routing
-    #     (notify_on_complete / watch_patterns) reads HERMES_SESSION_PLATFORM
-    #     and HERMES_SESSION_CHAT_ID to populate watcher_platform / chat_id,
-    #     which would route completion notifications to the origin chat
-    #     instead of via HERMES_CRON_AUTO_DELIVER_* below.
-    #   - tools/tts_tool.py: picks Opus vs MP3 based on
-    #     HERMES_SESSION_PLATFORM == "telegram".
-    #   - tools/skills_tool.py + agent/prompt_builder.py: per-platform
-    #     skill-disable lists and the system-prompt cache key both consume
-    #     HERMES_SESSION_PLATFORM.
-    #   - tools/send_message_tool.py: mirror source labelling and the
-    #     send_message gate read HERMES_SESSION_PLATFORM.
-    # Cron output delivery itself reads job["origin"] directly via
-    # _resolve_origin(job) and the HERMES_CRON_AUTO_DELIVER_* vars set
-    # below, so clearing HERMES_SESSION_* here does not affect delivery.
-    _ctx_tokens = set_session_vars(
-        platform="",
-        chat_id="",
-        chat_name="",
-    )
-    _cron_delivery_vars = (
-        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
-        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
-        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
-    )
-    for _var_name in _cron_delivery_vars:
-        _VAR_MAP[_var_name].set("")
+## Error
+
+```
+{error_msg}
+```
+"""
+        return False, output, "", error_msg
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -2741,37 +2976,9 @@ def run_job(
     # file / code-exec commands in the wrong directory.  For workdir-less jobs
     # we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    _job_workdir = (job.get("workdir") or "").strip() or None
-    if _job_workdir and not Path(_job_workdir).is_dir():
-        # Directory was removed between create-time validation and now.  Log
-        # and drop back to old behaviour rather than crashing the job.
-        logger.warning(
-            "Job '%s': configured workdir %r no longer exists — running without it",
-            job_id, _job_workdir,
-        )
-        _job_workdir = None
+    from gateway.session_context import _VAR_MAP
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
-
-    _holds_cwd_write = _job_workdir is not None
-    if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
-    else:
-        _terminal_cwd_lock.acquire_read()
-
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
-        if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
-            logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart. Route through
@@ -3315,24 +3522,9 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
-        # Clean up ContextVar session/delivery state for this job.
-        clear_session_vars(_ctx_tokens)
-        for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+        # Restore cron identity, nested session/CWD state, and the lock acquired
+        # by _cron_execution_scope. The scope also handles partial setup failure.
+        _cron_scope.__exit__(None, None, None)
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected

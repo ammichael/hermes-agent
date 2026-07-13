@@ -116,6 +116,7 @@ _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY"
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
@@ -133,6 +134,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -172,11 +174,15 @@ def set_session_vars(
 ) -> list:
     """Set all session context variables and return reset tokens.
 
-    Call ``clear_session_vars(tokens)`` in a ``finally`` block when the handler
+    Call ``clear_session_vars(tokens)`` in a ``finally`` block when a gateway handler
     exits. Note ``clear_session_vars`` resets every var to ``""`` (to suppress
     the ``os.environ`` fallback) rather than restoring prior values — these
     helpers are not nestable/stack-safe, and the returned tokens are accepted
     only for API compatibility.
+
+    Internal nested owners such as the cron scheduler must instead call
+    ``restore_session_vars(tokens)`` so a reused worker context gets its prior
+    CLI/gateway compatibility state back after the job.
 
     ``cwd`` pins the logical working directory for this context.
 
@@ -190,7 +196,7 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
-    tokens = [
+    tokens: list[Any] = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
         _SESSION_CHAT_ID.set(chat_id),
@@ -205,13 +211,49 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
+    cwd_token = None
     try:
         from agent.runtime_cwd import set_session_cwd
 
-        set_session_cwd(cwd)
+        cwd_token = set_session_cwd(cwd)
     except Exception:
         pass
+    tokens.append(cwd_token)
     return tokens
+
+
+def restore_session_vars(tokens: list) -> None:
+    """Restore the exact context that preceded ``set_session_vars``.
+
+    Unlike ``clear_session_vars`` this is stack-safe and intentionally revives
+    the legacy ``os.environ`` fallback when the prior ContextVar value was
+    ``_UNSET``. Use it only for nested/internal execution scopes such as cron;
+    gateway handler teardown must remain explicitly cleared.
+    """
+    vars_with_tokens = (
+        _SESSION_PLATFORM,
+        _SESSION_SOURCE,
+        _SESSION_CHAT_ID,
+        _SESSION_CHAT_NAME,
+        _SESSION_THREAD_ID,
+        _SESSION_USER_ID,
+        _SESSION_USER_NAME,
+        _SESSION_KEY,
+        _SESSION_ID,
+        _SESSION_UI_SESSION_ID,
+        _SESSION_MESSAGE_ID,
+        _SESSION_PROFILE,
+        _SESSION_ASYNC_DELIVERY,
+    )
+    if len(tokens) != len(vars_with_tokens) + 1:
+        raise ValueError("invalid session context token set")
+    for var, token in reversed(tuple(zip(vars_with_tokens, tokens[:-1]))):
+        var.reset(token)
+    cwd_token = tokens[-1]
+    if cwd_token is not None:
+        from agent.runtime_cwd import reset_session_cwd
+
+        reset_session_cwd(cwd_token)
 
 
 def clear_session_vars(tokens: list) -> None:

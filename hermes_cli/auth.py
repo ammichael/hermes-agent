@@ -3407,20 +3407,48 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         _save_auth_store(auth_store)
 
 
-def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
-    """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
+def _recover_missing_codex_provider_from_cli() -> Tuple[Optional[Dict[str, str]], bool]:
+    """Adopt Codex CLI tokens only while the Hermes provider remains absent.
+
+    Reading ``CODEX_HOME`` intentionally happens before taking the Hermes store
+    lock. The store is then reloaded under lock so a concurrent Hermes login,
+    usable pool credential, or quota marker wins over the stale import decision.
+    The boolean result says whether a complete CLI pair was available.
+    """
     imported = _import_codex_cli_tokens()
-    # Require BOTH tokens before adopting: persisting a payload without a
-    # usable refresh_token would only break the next refresh cycle.
     if not (
         imported
         and str(imported.get("access_token", "") or "").strip()
         and str(imported.get("refresh_token", "") or "").strip()
     ):
-        return None
-    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
-    return dict(imported)
+        return None, False
+
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex")
+        tokens = state.get("tokens") if isinstance(state, dict) else None
+        singleton_usable = (
+            isinstance(tokens, dict)
+            and bool(str(tokens.get("access_token", "") or "").strip())
+            and bool(str(tokens.get("refresh_token", "") or "").strip())
+        )
+        pool_token = _pool_codex_access_token()
+        pool_quota = _codex_pool_rate_limit_status()
+        provider_absent = state is None
+        if singleton_usable or pool_token or pool_quota:
+            return None, True
+        if not provider_absent:
+            # A malformed/empty provider is still authoritative and must not
+            # be overwritten from CODEX_HOME. It also is not evidence that a
+            # concurrent usable state appeared, so do not recurse forever.
+            return None, False
+
+        # Reentrant lock: _save_codex_tokens reloads the same store while no
+        # other cooperating Hermes process can write, making check+persist atomic.
+        _save_codex_tokens(imported)
+
+    logger.info("Codex auth recovered from Codex CLI auth.json (provider absent).")
+    return dict(imported), True
 
 
 def refresh_codex_oauth_pure(
@@ -3562,36 +3590,14 @@ def _refresh_codex_auth_tokens(
     timeout_seconds: float,
 ) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token.
-    
+
     Saves the new tokens to Hermes auth store automatically.
     """
-    try:
-        refreshed = refresh_codex_oauth_pure(
-            str(tokens.get("access_token", "") or ""),
-            str(tokens.get("refresh_token", "") or ""),
-            timeout_seconds=timeout_seconds,
-        )
-    except AuthError as exc:
-        # Self-heal cross-store refresh_token rotation. Hermes keeps its OWN
-        # Codex OAuth token (per profile + top-level), separate from the Codex
-        # CLI's ~/.codex/auth.json. OAuth refresh_tokens are single-use, so when
-        # the Codex CLI (or another Hermes process) rotates the shared token,
-        # this frozen copy's refresh_token goes stale and the refresh fails with
-        # a relogin-required error (invalid_grant / refresh_token_reused / 401).
-        # Before surfacing that as a hard 401 to the turn, adopt the canonical
-        # fresh token from ~/.codex/auth.json (the Codex CLI keeps it current) so
-        # idle profiles / desktop sessions recover automatically instead of
-        # 401'ing until a manual re-auth. Transient failures (e.g. 429 quota)
-        # keep relogin_required=False — the stored token is still valid there, so
-        # we never self-heal those and re-raise unchanged.
-        if not getattr(exc, "relogin_required", False):
-            raise
-        imported = _recover_codex_tokens_from_cli(
-            f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}"
-        )
-        if not imported:
-            raise
-        return imported
+    refreshed = refresh_codex_oauth_pure(
+        str(tokens.get("access_token", "") or ""),
+        str(tokens.get("refresh_token", "") or ""),
+        timeout_seconds=timeout_seconds,
+    )
 
     updated_tokens = dict(tokens)
     updated_tokens["access_token"] = refreshed["access_token"]
@@ -3635,6 +3641,46 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _resolve_codex_pool_runtime_credentials() -> Optional[Dict[str, Any]]:
+    """Resolve a usable Codex pool token or raise its authoritative quota state."""
+    pool_token = _pool_codex_access_token()
+    if pool_token:
+        base_url = (
+            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            or DEFAULT_CODEX_BASE_URL
+        )
+        return {
+            "provider": "openai-codex",
+            "base_url": base_url,
+            "api_key": pool_token,
+            "source": "credential_pool",
+            "last_refresh": None,
+            "auth_mode": "chatgpt",
+        }
+
+    pool_rate_limit = _codex_pool_rate_limit_status()
+    if not pool_rate_limit:
+        return None
+    reset_at = pool_rate_limit.get("reset_at")
+    if isinstance(reset_at, (int, float)) and reset_at > time.time():
+        remaining = int(reset_at - time.time())
+        message = (
+            f"Codex provider quota exhausted (429); retry after {remaining}s. "
+            "Credentials are still valid."
+        )
+    else:
+        message = (
+            "Codex provider quota exhausted (429). Credentials are still valid; "
+            "retry after the usage limit resets."
+        )
+    raise AuthError(
+        message,
+        provider="openai-codex",
+        code=CODEX_RATE_LIMITED_CODE,
+        relogin_required=False,
+    )
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -3657,62 +3703,38 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
-            else:
-                data = None
-        else:
-            data = None
+        data = None
 
     if data is None:
-        pool_token = _pool_codex_access_token()
-        if pool_token:
-            base_url = (
-                os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-                or DEFAULT_CODEX_BASE_URL
-            )
-            return {
-                "provider": "openai-codex",
-                "base_url": base_url,
-                "api_key": pool_token,
-                "source": "credential_pool",
-                "last_refresh": None,
-                "auth_mode": "chatgpt",
-            }
-        pool_rate_limit = _codex_pool_rate_limit_status()
-        if pool_rate_limit:
-            reset_at = pool_rate_limit.get("reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > time.time():
-                remaining = int(reset_at - time.time())
-                message = (
-                    f"Codex provider quota exhausted (429); retry after {remaining}s. "
-                    "Credentials are still valid."
+        pool_credentials = _resolve_codex_pool_runtime_credentials()
+        if pool_credentials:
+            return pool_credentials
+        if (
+            read_error is not None
+            and getattr(read_error, "relogin_required", False)
+            and getattr(read_error, "code", None) == "codex_auth_missing"
+        ):
+            imported, cli_pair_available = _recover_missing_codex_provider_from_cli()
+            if imported:
+                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+            elif cli_pair_available:
+                # A concurrent singleton/pool/quota/provider write won the
+                # under-lock revalidation. Resolve that fresh state without
+                # attempting a second CLI import.
+                return resolve_codex_runtime_credentials(
+                    force_refresh=force_refresh,
+                    refresh_if_expiring=refresh_if_expiring,
+                    refresh_skew_seconds=refresh_skew_seconds,
                 )
-            else:
-                message = (
-                    "Codex provider quota exhausted (429). Credentials are still valid; "
-                    "retry after the usage limit resets."
-                )
-            raise AuthError(
-                message,
-                provider="openai-codex",
-                code=CODEX_RATE_LIMITED_CODE,
-                relogin_required=False,
-            )
-        if read_error is not None:
+        if data is None and read_error is not None:
             raise read_error
-        raise AuthError(
-            "No Codex credentials stored. Run `hermes auth` to authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing",
-            relogin_required=True,
-        )
+        if data is None:
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
 
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
@@ -3721,6 +3743,7 @@ def resolve_codex_runtime_credentials(
     should_refresh = bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+    refresh_error: Optional[AuthError] = None
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
@@ -3733,8 +3756,22 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
-                access_token = str(tokens.get("access_token", "") or "").strip()
+                try:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
+                except AuthError as exc:
+                    # A present Hermes provider is authoritative: never consult
+                    # CODEX_HOME after its refresh fails. Only relogin-required
+                    # failures may fall through to local pool/quota state.
+                    if not getattr(exc, "relogin_required", False):
+                        raise
+                    refresh_error = exc
+
+    if refresh_error is not None:
+        pool_credentials = _resolve_codex_pool_runtime_credentials()
+        if pool_credentials:
+            return pool_credentials
+        raise refresh_error
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -3751,31 +3788,68 @@ def resolve_codex_runtime_credentials(
     }
 
 
-def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
-    """Return metadata for a pool-only Codex credential in quota cooldown."""
-    def _parse_reset_at(value: Any) -> Optional[float]:
-        if value is None or value == "":
+def _parse_codex_pool_reset_at(value: Any) -> Optional[float]:
+    """Normalize a pool quota reset timestamp to epoch seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
             return None
-        if isinstance(value, (int, float)):
-            numeric = float(value)
-            if numeric <= 0:
-                return None
-            return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
-        if isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                return None
-            try:
-                numeric = float(raw)
-            except ValueError:
-                numeric = None
-            if numeric is not None:
-                return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+        try:
+            numeric = float(raw)
+        except ValueError:
             try:
                 return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
             except ValueError:
                 return None
+    else:
         return None
+    if numeric <= 0:
+        return None
+    return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+
+
+def _codex_pool_entry_rate_limit_status(
+    entry: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Classify an entry whose active quota marker makes it unusable."""
+    reset_at = _parse_codex_pool_reset_at(entry.get("last_error_reset_at"))
+    current_time = time.time() if now is None else now
+    if reset_at is not None and reset_at <= current_time:
+        return None
+
+    code = str(entry.get("last_error_code") or "").strip()
+    reason = str(entry.get("last_error_reason") or "").lower()
+    message = str(entry.get("last_error_message") or "").lower()
+    markers = ("rate_limit", "usage_limit", "quota", "rate limit", "usage limit")
+    exhausted_rate_limit = (
+        str(entry.get("last_status") or "").lower() == "exhausted"
+        and (
+            code == "429"
+            or any(marker in reason or marker in message for marker in markers)
+        )
+    )
+    # Preserve legacy explicit cooldown markers even when older pool writers did
+    # not persist last_status/error details. Unknown resets require the stronger
+    # exhausted + rate-limit classification above.
+    if not exhausted_rate_limit and not (reset_at is not None and reset_at > current_time):
+        return None
+    return {
+        "label": entry.get("label"),
+        "last_refresh": entry.get("last_refresh"),
+        "reset_at": reset_at,
+        "reason": entry.get("last_error_reason"),
+        "message": entry.get("last_error_message"),
+    }
+
+
+def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
+    """Return metadata for a pool-only Codex credential in quota cooldown."""
 
     try:
         with _auth_store_lock():
@@ -3793,32 +3867,9 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 continue
-            if entry.get("last_status") != "exhausted":
-                continue
-            code = entry.get("last_error_code")
-            reason = str(entry.get("last_error_reason") or "").lower()
-            message = str(entry.get("last_error_message") or "").lower()
-            is_rate_limited = (
-                code == 429
-                or "rate_limit" in reason
-                or "usage_limit" in reason
-                or "quota" in reason
-                or "rate limit" in message
-                or "usage limit" in message
-                or "quota" in message
-            )
-            if not is_rate_limited:
-                continue
-            reset_at = _parse_reset_at(entry.get("last_error_reset_at"))
-            if reset_at is not None and reset_at <= now:
-                continue
-            return {
-                "label": entry.get("label"),
-                "last_refresh": entry.get("last_refresh"),
-                "reset_at": reset_at,
-                "reason": entry.get("last_error_reason"),
-                "message": entry.get("last_error_message"),
-            }
+            rate_limit_status = _codex_pool_entry_rate_limit_status(entry, now=now)
+            if rate_limit_status is not None:
+                return rate_limit_status
     except Exception:
         logger.debug("Codex pool rate-limit lookup failed", exc_info=True)
     return None
@@ -3850,9 +3901,9 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
-            # Skip entries currently in an exhaustion cooldown window.
-            reset_at = entry.get("last_error_reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > time.time():
+            # Missing/unparseable reset metadata keeps an exhausted entry in
+            # quota; a parseable reset makes it eligible again only after expiry.
+            if _codex_pool_entry_rate_limit_status(entry) is not None:
                 return False
             return True
 

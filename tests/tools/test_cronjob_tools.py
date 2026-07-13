@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from unittest.mock import patch
 
 from tools.cronjob_tools import (
     _scan_cron_prompt,
@@ -704,3 +705,24 @@ class TestValidateCronBaseUrl:
 
     def test_base_url_without_provider_rejected(self):
         assert self._v(None, "https://x.example/v1") is not None
+
+
+def test_registered_handler_forwards_attach_to_session():
+    """Regression: the schema field must reach cronjob(), not be discarded."""
+    import tools.cronjob_tools as cron_tools
+    from tools.registry import registry
+
+    entry = registry.get_entry("cronjob")
+    assert entry is not None
+
+    with patch.object(cron_tools, "cronjob", return_value={"success": True}) as call:
+        entry.handler(
+            {
+                "action": "create",
+                "schedule": "every 1h",
+                "prompt": "continuable",
+                "attach_to_session": True,
+            }
+        )
+
+    assert call.call_args.kwargs["attach_to_session"] is True
