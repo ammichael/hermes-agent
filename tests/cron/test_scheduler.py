@@ -9,9 +9,48 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_enabled_toolsets,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    _summarize_cron_failure_for_delivery,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestCronFailureDeliveryPrivacy:
+    def test_missing_script_does_not_expose_local_path(self):
+        message = _summarize_cron_failure_for_delivery(
+            {"name": "Daily monitor"},
+            "Script not found: /Users/example/.hermes/scripts/private-monitor.py",
+        )
+
+        assert "required script is missing" in message
+        assert "/Users/" not in message
+        assert ".hermes" not in message
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "PermissionError: /Users/example/private/token.txt",
+            "failed reading /home/example/.config/secret.json",
+            r"failed reading C:\\Users\\example\\secret.txt",
+        ],
+    )
+    def test_generic_failure_redacts_absolute_local_paths(self, error):
+        message = _summarize_cron_failure_for_delivery(
+            {"name": "Daily monitor"}, error,
+        )
+
+        assert "[local path]" in message
+        assert "example" not in message
 
 
 class TestPerJobToolsetMcpMerge:

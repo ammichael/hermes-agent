@@ -89,12 +89,34 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    # Script setup failures commonly contain an absolute local path.  That is
+    # useful in logs, but it leaks usernames, home-directory layout, and other
+    # host details when delivered to a chat.  Keep the user-facing diagnosis
+    # actionable while the original error remains available in cron output.
+    if "script not found:" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: required script is missing. "
+            "Full details saved in cron output."
+        )
+    if "script path is not a file:" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: required script is unavailable. "
+            "Full details saved in cron output."
+        )
+
     # Strip common exception wrappers and collapse provider payloads. Bound
     # the input first so a multi-KB provider blob cannot slow the
     # substitutions.
     cleaned = re.sub(
         r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
         "", text[:2000],
+    )
+    # Defense in depth for miscellaneous failures: redact Unix/macOS and
+    # Windows absolute paths before the generic summary reaches any channel.
+    cleaned = re.sub(
+        r"(?<![A-Za-z0-9_])(?:/(?:Users|home|var|private|tmp)/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)",
+        "[local path]",
+        cleaned,
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 180:
