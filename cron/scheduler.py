@@ -134,6 +134,17 @@ def _cron_output_privacy_violation(content: str | None) -> Optional[str]:
     remains in the local cron artifact for diagnosis.
     """
     text = (content or "")[:20_000]
+    # MEDIA:/local/path is a transport directive, not delivered text: the
+    # platform adapter extracts it and sends the file. Remove those directives
+    # before scanning so legitimate attachment jobs are not false positives.
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        _, text = BasePlatformAdapter.extract_media(text)
+    except Exception:
+        # Fail closed: if media parsing itself is unavailable, scan the original
+        # text rather than allowing a local path through.
+        pass
     checks = (
         ("local_path", r"(?<![A-Za-z0-9_])(?:/(?:Users|home|Volumes|private|var|tmp)/|[A-Za-z]:\\Users\\|\.hermes/)"),
         ("traceback", r"Traceback \(most recent call last\)"),

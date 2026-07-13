@@ -171,6 +171,11 @@ class TestCronFailureDeliveryPrivacy:
             "🎮 Tibia — Draptor está disponível agora. Janela termina às 21h."
         ) is None
 
+    def test_success_output_guard_allows_extracted_media_directive(self):
+        assert _cron_output_privacy_violation(
+            "Relatório pronto.\nMEDIA:/Users/example/reports/status.png"
+        ) is None
+
 
 class TestPerJobToolsetMcpMerge:
     """A per-job enabled_toolsets allowlist must not silently drop MCP servers."""
