@@ -328,8 +328,8 @@ def test_rejected_refresh_never_persists_cli_half_token(monkeypatch):
     assert saved == {}
 
 
-def test_incomplete_singleton_does_not_import_codex_cli(tmp_path, monkeypatch):
-    """A present-but-incomplete provider must not be overwritten from CODEX_HOME."""
+def test_incomplete_singleton_self_heals_from_codex_cli(tmp_path, monkeypatch):
+    """A present-but-incomplete provider is recovered from a valid Codex CLI store."""
     hermes_home = tmp_path / "hermes"
     codex_home = tmp_path / "codex"
     hermes_home.mkdir()
@@ -341,6 +341,10 @@ def test_incomplete_singleton_does_not_import_codex_cli(tmp_path, monkeypatch):
                 "tokens": {"refresh_token": "stale-refresh"},
                 "last_refresh": "2026-06-01T00:00:00Z",
                 "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "code": "codex_auth_missing_access_token",
+                    "message": "missing access token",
+                },
             },
         },
     }))
@@ -353,14 +357,17 @@ def test_incomplete_singleton_does_not_import_codex_cli(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    with pytest.raises(AuthError) as exc_info:
-        resolve_codex_runtime_credentials()
+    resolved = resolve_codex_runtime_credentials()
 
-    assert exc_info.value.code == "codex_auth_missing_access_token"
+    assert resolved["api_key"] == "fresh-access"
+    assert resolved["source"] == "hermes-auth-store"
     stored = json.loads((hermes_home / "auth.json").read_text())
-    assert stored["providers"]["openai-codex"]["tokens"] == {
-        "refresh_token": "stale-refresh",
+    provider = stored["providers"]["openai-codex"]
+    assert provider["tokens"] == {
+        "access_token": "fresh-access",
+        "refresh_token": "fresh-refresh",
     }
+    assert "last_auth_error" not in provider
 
 
 def test_self_heals_missing_provider_from_codex_cli(tmp_path, monkeypatch, caplog):
@@ -395,8 +402,8 @@ def test_self_heals_missing_provider_from_codex_cli(tmp_path, monkeypatch, caplo
     assert "fresh-refresh" not in caplog.text
 
 
-def test_empty_provider_does_not_import_cli_or_recurse(tmp_path, monkeypatch):
-    """A present-but-empty provider remains authoritative and fails cleanly."""
+def test_empty_provider_self_heals_from_codex_cli(tmp_path, monkeypatch):
+    """A present-but-empty provider is treated as recoverable, not authoritative."""
     hermes_home = tmp_path / "hermes"
     codex_home = tmp_path / "codex"
     hermes_home.mkdir()
@@ -414,12 +421,14 @@ def test_empty_provider_does_not_import_cli_or_recurse(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    with pytest.raises(auth.AuthError) as exc_info:
-        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+    resolved = resolve_codex_runtime_credentials(refresh_if_expiring=False)
 
-    assert exc_info.value.code == "codex_auth_missing"
+    assert resolved["api_key"] == "cli-access-token"
     stored = json.loads((hermes_home / "auth.json").read_text())
-    assert stored["providers"]["openai-codex"] == {}
+    assert stored["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "cli-access-token",
+        "refresh_token": "cli-refresh-token",
+    }
 
 
 def test_incomplete_singleton_prefers_usable_pool_over_codex_cli(tmp_path, monkeypatch):

@@ -3359,6 +3359,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
+        state.pop("last_auth_error", None)
         if label and str(label).strip():
             state["label"] = str(label).strip()
         _save_provider_state(auth_store, "openai-codex", state)
@@ -3372,7 +3373,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
 
 
 def _recover_missing_codex_provider_from_cli() -> Tuple[Optional[Dict[str, str]], bool]:
-    """Adopt Codex CLI tokens only while the Hermes provider remains absent.
+    """Adopt Codex CLI tokens while the Hermes provider is absent or incomplete.
 
     Reading ``CODEX_HOME`` intentionally happens before taking the Hermes store
     lock. The store is then reloaded under lock so a concurrent Hermes login,
@@ -3398,20 +3399,25 @@ def _recover_missing_codex_provider_from_cli() -> Tuple[Optional[Dict[str, str]]
         )
         pool_token = _pool_codex_access_token()
         pool_quota = _codex_pool_rate_limit_status()
-        provider_absent = state is None
+        provider_recoverable = (
+            state is None
+            or not isinstance(tokens, dict)
+            or not str(tokens.get("access_token", "") or "").strip()
+            or not str(tokens.get("refresh_token", "") or "").strip()
+        )
         if singleton_usable or pool_token or pool_quota:
             return None, True
-        if not provider_absent:
-            # A malformed/empty provider is still authoritative and must not
-            # be overwritten from CODEX_HOME. It also is not evidence that a
-            # concurrent usable state appeared, so do not recurse forever.
+        if not provider_recoverable:
+            # A provider with usable token material is authoritative and must
+            # not be overwritten from CODEX_HOME. It also is not evidence that
+            # a concurrent usable state appeared, so do not recurse forever.
             return None, False
 
         # Reentrant lock: _save_codex_tokens reloads the same store while no
         # other cooperating Hermes process can write, making check+persist atomic.
         _save_codex_tokens(imported)
 
-    logger.info("Codex auth recovered from Codex CLI auth.json (provider absent).")
+    logger.info("Codex auth recovered from Codex CLI auth.json (provider absent/incomplete).")
     return dict(imported), True
 
 
@@ -3676,7 +3682,13 @@ def resolve_codex_runtime_credentials(
         if (
             read_error is not None
             and getattr(read_error, "relogin_required", False)
-            and getattr(read_error, "code", None) == "codex_auth_missing"
+            and getattr(read_error, "code", None)
+            in {
+                "codex_auth_missing",
+                "codex_auth_invalid_shape",
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+            }
         ):
             imported, cli_pair_available = _recover_missing_codex_provider_from_cli()
             if imported:
