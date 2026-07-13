@@ -12,6 +12,7 @@ import pytest
 from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
+    _cron_output_privacy_violation,
     _deliver_cron_failure,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
@@ -151,6 +152,24 @@ class TestCronFailureDeliveryPrivacy:
         assert "Cronjob Response" not in args[3]
         assert "job_id" not in args[3]
         assert "To stop or manage" not in args[3]
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Permission denied: /Users/example/.hermes/scripts/monitor.py",
+            "Traceback (most recent call last):\n  File ...",
+            "stderr: provider returned an internal error",
+            "Cronjob Response: monitor\n(job_id: abc123)",
+            "Gateway monitor failed with timeout",
+        ],
+    )
+    def test_success_output_guard_blocks_operational_diagnostics(self, content):
+        assert _cron_output_privacy_violation(content)
+
+    def test_success_output_guard_allows_domain_message(self):
+        assert _cron_output_privacy_violation(
+            "🎮 Tibia — Draptor está disponível agora. Janela termina às 21h."
+        ) is None
 
 
 class TestPerJobToolsetMcpMerge:
@@ -2739,6 +2758,27 @@ class TestSilentDelivery:
         normal_delivery.assert_not_called()
         failure_delivery.assert_called_once()
         assert "some error" in failure_delivery.call_args.args[1]
+
+    def test_zero_exit_operational_log_is_blocked_from_normal_audience(self):
+        job = self._make_job()
+        leaked = "Permission denied: /Users/example/.hermes/scripts/monitor.py"
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", leaked, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as normal_delivery, \
+             patch("cron.scheduler._deliver_cron_failure") as failure_delivery, \
+             patch("cron.scheduler.mark_job_run") as mark:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        normal_delivery.assert_not_called()
+        failure_delivery.assert_called_once()
+        routed = failure_delivery.call_args.args[1]
+        assert "/Users/" not in routed
+        assert ".hermes" not in routed
+        mark.assert_called_once()
+        assert mark.call_args.args[1] is False
+        assert "blocked from normal delivery" in mark.call_args.args[2]
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \

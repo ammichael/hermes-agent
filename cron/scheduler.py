@@ -124,6 +124,32 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _cron_output_privacy_violation(content: str | None) -> Optional[str]:
+    """Classify operational diagnostics that must not reach normal audiences.
+
+    Script-only jobs can mistakenly catch an exception, print it to stdout, and
+    still exit zero.  Status-only routing would then treat the diagnostic as a
+    successful community message.  This bounded deterministic guard catches the
+    high-confidence shapes that expose host/runtime internals.  The full output
+    remains in the local cron artifact for diagnosis.
+    """
+    text = (content or "")[:20_000]
+    checks = (
+        ("local_path", r"(?<![A-Za-z0-9_])(?:/(?:Users|home|Volumes|private|var|tmp)/|[A-Za-z]:\\Users\\|\.hermes/)"),
+        ("traceback", r"Traceback \(most recent call last\)"),
+        ("script_runtime", r"(?i)\b(?:Script not found|script path is not a file|stderr:|stdout:|exit_code)\b"),
+        ("cron_wrapper", r"(?i)\b(?:Cronjob Response:|job_id\s*:)"),
+        (
+            "operational_failure",
+            r"(?i)\b(?:cron|scheduler|gateway|provider|tool|collector|monitor)\b.{0,48}\b(?:failed|failure|error|timeout|permission denied)\b",
+        ),
+    )
+    for code, pattern in checks:
+        if re.search(pattern, text):
+            return code
+    return None
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -3794,6 +3820,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # (output is already saved above). Failed runs still produce a
             # summary, but only through the isolated technical failure route.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # A script may print an exception/log to stdout and still exit 0.
+            # Treat that as a failed run before delivery so normal groups never
+            # receive host/runtime diagnostics disguised as successful output.
+            deliver_intent = _normalize_deliver_value(job.get("deliver", "local"))
+            if success and deliver_intent != "local":
+                privacy_violation = _cron_output_privacy_violation(deliver_content)
+                if privacy_violation:
+                    logger.warning(
+                        "Job '%s': blocked unsafe cron output from normal delivery (%s)",
+                        job["id"], privacy_violation,
+                    )
+                    success = False
+                    error = (
+                        "Unsafe operational diagnostic blocked from normal delivery "
+                        f"({privacy_violation})"
+                    )
+                    deliver_content = _summarize_cron_failure_for_delivery(job, error)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
