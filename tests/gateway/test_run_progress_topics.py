@@ -697,6 +697,26 @@ class QueuedCommentaryAgent:
         }
 
 
+class QueuedOperationalFailureAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        response = (
+            "⚠️ Provider authentication failed. Check configured credentials."
+            if type(self).calls == 1
+            else "normal follow-up answer"
+        )
+        return {
+            "final_response": response,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -707,6 +727,33 @@ class BackgroundReviewAgent:
             self.background_review_callback("💾 Skill 'prospect-scanner' created.")
         return {
             "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class InternalCallbacksAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.status_callback = kwargs.get("status_callback")
+        self.notice_callback = kwargs.get("notice_callback")
+        self.background_review_callback = kwargs.get("background_review_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.tool_progress_callback:
+            self.tool_progress_callback("tool.started", "terminal", None, {})
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("Internal scratch", already_streamed=False)
+        if self.status_callback:
+            self.status_callback("lifecycle", "📦 Pre-API compression")
+        if self.notice_callback:
+            self.notice_callback(types.SimpleNamespace(text="⚠ Credits low"))
+        if self.background_review_callback:
+            self.background_review_callback("💾 Skill updated")
+        return {
+            "final_response": "normal answer",
             "messages": [],
             "api_calls": 1,
         }
@@ -746,6 +793,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    suppress_internal_group_output=False,
 ):
     if config_data:
         import yaml
@@ -791,6 +839,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        suppress_internal_group_output=suppress_internal_group_output,
     )
     return adapter, result
 
@@ -1091,6 +1140,25 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 
 @pytest.mark.asyncio
+async def test_mixed_group_queued_followup_does_not_send_provider_failure(monkeypatch, tmp_path):
+    QueuedOperationalFailureAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedOperationalFailureAgent,
+        session_id="sess-queued-mixed-failure",
+        pending_text="queued follow-up",
+        platform=Platform.WHATSAPP,
+        chat_id="mixed-group@g.us",
+        thread_id="",
+        suppress_internal_group_output=True,
+    )
+
+    assert result["final_response"] == "normal follow-up answer"
+    assert all("authentication failed" not in call["content"].lower() for call in adapter.sent)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1101,6 +1169,30 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
     )
 
     assert result["final_response"] == "done"
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_whatsapp_group_disables_internal_callbacks(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InternalCallbacksAgent,
+        session_id="sess-whatsapp-mixed-audience",
+        platform=Platform.WHATSAPP,
+        chat_id="mixed-group@g.us",
+        thread_id="",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        suppress_internal_group_output=True,
+    )
+    await asyncio.sleep(0)
+
+    assert result["final_response"] == "normal answer"
     assert adapter.sent == []
 
 

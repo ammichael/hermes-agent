@@ -1054,6 +1054,10 @@ app.get('/chat/:id', async (req, res) => {
         name: metadata.subject,
         isGroup: true,
         participants: metadata.participants.map(p => p.id),
+        botIds: Array.from(new Set([
+          normalizeWhatsAppId(sock.user?.id),
+          normalizeWhatsAppId(sock.user?.lid),
+        ].filter(Boolean))),
       });
     } catch {
       // Fall through to default

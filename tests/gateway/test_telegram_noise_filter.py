@@ -1,11 +1,15 @@
 """Gateway noise/secret filtering across chat surfaces (Telegram + siblings)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from gateway.config import Platform
 from gateway.run import (
     _prepare_gateway_status_message,
+    _resolve_whatsapp_group_output_suppression,
     _sanitize_gateway_final_response,
+    _whatsapp_group_has_external_audience,
 )
 
 # Every human-facing chat surface that must receive noise-filtered,
@@ -151,6 +155,139 @@ def test_chat_gateways_drop_interrupt_sentinel(platform):
 
     assert _sanitize_gateway_final_response(platform, sentinel) == ""
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
+
+
+@pytest.mark.parametrize(
+    ("info", "sender_ids", "private_users", "expected"),
+    [
+        (
+            {"participants": ["mike", "n"], "bot_ids": ["n"]},
+            ["mike"],
+            ["mike"],
+            False,
+        ),
+        (
+            {"participants": ["mike", "n", "third-party"], "bot_ids": ["n"]},
+            ["mike"],
+            ["mike"],
+            True,
+        ),
+        (
+            {"participants": ["mike", "third-party"], "bot_ids": ["n"]},
+            ["mike"],
+            ["mike"],
+            True,
+        ),
+        (
+            {"participants": ["third-party", "n"], "bot_ids": ["n"]},
+            ["third-party"],
+            ["mike"],
+            True,
+        ),
+        ({"participants": [], "bot_ids": ["n"]}, ["mike"], ["mike"], True),
+        ({}, ["mike"], ["mike"], True),
+        ({"participants": ["mike", "n"]}, ["mike"], ["mike"], True),
+    ],
+)
+def test_whatsapp_group_audience_fails_closed(
+    info, sender_ids, private_users, expected
+):
+    assert (
+        _whatsapp_group_has_external_audience(
+            "whatsapp",
+            "group",
+            info,
+            sender_ids=sender_ids,
+            private_workspace_users=private_users,
+        )
+        is expected
+    )
+
+
+def test_non_whatsapp_or_dm_never_uses_group_audience_suppression():
+    mixed = {"participants": ["mike", "n", "third-party"]}
+    assert not _whatsapp_group_has_external_audience("telegram", "group", mixed)
+    assert not _whatsapp_group_has_external_audience("whatsapp", "dm", mixed)
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_group_audience_resolver_uses_live_adapter_metadata():
+    class Adapter:
+        async def get_chat_info(self, chat_id):
+            assert chat_id == "group@g.us"
+            return {
+                "participants": ["mike", "n"],
+                "bot_ids": ["n"],
+            }
+
+    source = SimpleNamespace(
+        platform="whatsapp",
+        chat_type="group",
+        chat_id="group@g.us",
+        user_id="mike",
+        user_id_alt=None,
+    )
+    assert not await _resolve_whatsapp_group_output_suppression(
+        Adapter(),
+        source,
+        {"whatsapp": {"private_workspace_users": ["mike"]}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_group_audience_resolver_fails_closed_on_lookup_error():
+    class BrokenAdapter:
+        async def get_chat_info(self, chat_id):
+            raise RuntimeError("bridge unavailable")
+
+    source = SimpleNamespace(
+        platform="whatsapp",
+        chat_type="group",
+        chat_id="group@g.us",
+        user_id="mike",
+        user_id_alt=None,
+    )
+    assert await _resolve_whatsapp_group_output_suppression(
+        BrokenAdapter(),
+        source,
+        {"whatsapp": {"private_workspace_users": ["mike"]}},
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "⚠️ Provider authentication failed. Check the configured credentials.",
+        "The request failed: upstream unavailable\nTry again or use /reset.",
+        "⚠️ Processing completed but no response was generated.",
+        "⚠️ The model returned no response after processing tool results.",
+        "⚠️ Proxy error (502): upstream failed",
+        "⚠️ Proxy connection error: connection refused",
+        "(No response from remote agent)",
+        "⏱️ Agent inactive for 30 min — no API responses.",
+    ],
+)
+def test_mixed_group_suppresses_operational_final_failures(message):
+    assert (
+        _sanitize_gateway_final_response(
+            "whatsapp",
+            message,
+            suppress_operational_failures=True,
+        )
+        == ""
+    )
+
+
+def test_mixed_group_keeps_normal_final_answer():
+    answer = "Luisin foi adicionado à lista de personagens em missão."
+    assert (
+        _sanitize_gateway_final_response(
+            "whatsapp",
+            answer,
+            suppress_operational_failures=True,
+        )
+        == answer
+    )
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():

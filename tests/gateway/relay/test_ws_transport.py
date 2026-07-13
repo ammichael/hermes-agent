@@ -78,7 +78,17 @@ class _StubConnectorServer:
         elif ftype == "outbound":
             action = frame.get("action", {})
             # Echo a successful result correlated by requestId.
-            result = {"success": True, "message_id": f"srv-{action.get('op')}"}
+            if action.get("op") == "get_chat_info":
+                result = {
+                    "chat_info": {
+                        "name": "Private workspace",
+                        "type": "group",
+                        "participants": ["owner", "bot"],
+                        "bot_ids": ["bot"],
+                    }
+                }
+            else:
+                result = {"success": True, "message_id": f"srv-{action.get('op')}"}
             await ws.send(
                 json.dumps({"type": "outbound_result", "requestId": frame["requestId"], "result": result})
                 + "\n"
@@ -146,6 +156,23 @@ async def test_outbound_round_trips_with_correlation(server):
         result = await t.send_outbound({"op": "send", "chat_id": "chan1", "content": "hi"})
         assert result["success"] is True
         assert result["message_id"] == "srv-send"
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_preserves_audience_identity(server):
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    await t.connect()
+    try:
+        await t.handshake()
+        info = await t.get_chat_info("group-1")
+        assert info == {
+            "name": "Private workspace",
+            "type": "group",
+            "participants": ["owner", "bot"],
+            "bot_ids": ["bot"],
+        }
     finally:
         await t.disconnect()
 

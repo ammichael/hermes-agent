@@ -430,7 +430,18 @@ class WebSocketRelayTransport:
         )
         # The connector answers chat-info inside the outbound_result envelope.
         info = result.get("chat_info") or result
-        return {"name": info.get("name", chat_id), "type": info.get("type", "dm")}
+        participants = info.get("participants")
+        if not isinstance(participants, list):
+            participants = []
+        bot_ids = info.get("bot_ids") or info.get("botIds")
+        if not isinstance(bot_ids, list):
+            bot_ids = []
+        return {
+            "name": info.get("name", chat_id),
+            "type": info.get("type", "dm"),
+            "participants": participants,
+            "bot_ids": bot_ids,
+        }
 
     async def send_interrupt(self, session_key: str, reason: Optional[str] = None) -> None:
         await self._send({"type": "interrupt", "session_key": session_key, "reason": reason})

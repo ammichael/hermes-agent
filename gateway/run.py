@@ -439,7 +439,28 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+_GATEWAY_OPERATIONAL_FAILURE_REPLY_RE = re.compile(
+    r"^\s*(?:\W+\s*)?(?:"
+    r"the\s+request\s+failed"
+    r"|session\s+too\s+large\s+for\s+the\s+model"
+    r"|processing\s+(?:completed\s+but\s+no\s+response|stopped)"
+    r"|the\s+model\s+returned\s+no\s+response"
+    r"|proxy\s+(?:connection\s+)?error"
+    r"|\(?no\s+response\s+from\s+remote\s+agent\)?"
+    r"|agent\s+inactive\s+for\s+\d"
+    r"|no\s+activity\s+for\s+\d"
+    r"|your\s+message\s+(?:was(?:n't|\s+not)\s+processed|was\s+interrupted)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_gateway_final_response(
+    platform: Any,
+    text: str,
+    *,
+    suppress_operational_failures: bool = False,
+) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -460,9 +481,99 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    if suppress_operational_failures and (
+        _looks_like_gateway_provider_error(redacted)
+        or _GATEWAY_OPERATIONAL_FAILURE_REPLY_RE.search(redacted)
+    ):
+        return ""
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+def _whatsapp_group_has_external_audience(
+    platform: Any,
+    chat_type: str,
+    chat_info: Any,
+    *,
+    sender_ids: Any = None,
+    private_workspace_users: Any = None,
+) -> bool:
+    """Fail closed unless a WhatsApp group is provably Mike + N only.
+
+    Participant count alone is insufficient: a two-person group could contain
+    N and somebody other than Mike. The current sender must match an explicitly
+    configured private-workspace user, and that identity must be present in the
+    bridge's participant metadata. Phone-JID/LID aliases are canonicalized via
+    the same resolver used by WhatsApp session keys.
+    """
+    if _gateway_platform_value(platform) != "whatsapp" or chat_type != "group":
+        return False
+    if not isinstance(chat_info, dict):
+        return True
+    participants = chat_info.get("participants")
+    if not isinstance(participants, list) or len(participants) != 2:
+        return True
+
+    from gateway.whatsapp_identity import canonical_whatsapp_identifier
+
+    def _canonical_set(values: Any) -> set[str]:
+        if isinstance(values, str):
+            values = values.split(",")
+        if not isinstance(values, (list, tuple, set)):
+            return set()
+        return {
+            canonical
+            for value in values
+            if (canonical := canonical_whatsapp_identifier(str(value)))
+        }
+
+    expected_users = _canonical_set(private_workspace_users)
+    current_senders = _canonical_set(sender_ids)
+    current_participants = _canonical_set(participants)
+    current_bot_ids = _canonical_set(
+        chat_info.get("bot_ids") or chat_info.get("botIds")
+    )
+    if not expected_users or not current_senders or not current_bot_ids:
+        return True
+    owner_matches = expected_users & current_senders & current_participants
+    bot_matches = current_bot_ids & current_participants
+    return not bool(owner_matches and bot_matches and not (owner_matches & bot_matches))
+
+
+async def _resolve_whatsapp_group_output_suppression(
+    adapter: Any,
+    source: Any,
+    user_config: Any,
+) -> bool:
+    """Resolve the current WhatsApp audience; unknown state fails closed."""
+    if (
+        _gateway_platform_value(getattr(source, "platform", None)) != "whatsapp"
+        or getattr(source, "chat_type", None) != "group"
+    ):
+        return False
+
+    chat_info: Any = None
+    if adapter is not None:
+        try:
+            chat_info = await adapter.get_chat_info(getattr(source, "chat_id", "") or "")
+        except Exception:
+            logger.debug(
+                "Could not resolve WhatsApp group audience; suppressing internal output",
+                exc_info=True,
+            )
+    config = user_config if isinstance(user_config, dict) else {}
+    whatsapp_config = config.get("whatsapp") or {}
+    return _whatsapp_group_has_external_audience(
+        getattr(source, "platform", None),
+        getattr(source, "chat_type", ""),
+        chat_info,
+        sender_ids=[
+            getattr(source, "user_id", None),
+            getattr(source, "user_id_alt", None),
+        ],
+        private_workspace_users=whatsapp_config.get("private_workspace_users"),
+    )
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -10984,11 +11095,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
+        _pcfg: dict = {}
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
         except Exception:
             pass
+
+        # Resolve the WhatsApp audience before any user-facing session hygiene,
+        # reset, onboarding, or agent-run output. Unknown metadata and missing
+        # owner identity config fail closed.
+        _suppress_internal_group_output = (
+            await _resolve_whatsapp_group_output_suppression(
+                self._adapter_for_source(source),
+                source,
+                _pcfg,
+            )
+        )
+        if _suppress_internal_group_output:
+            logger.info(
+                "WhatsApp mixed/unknown-audience group: "
+                "internal gateway output suppressed"
+            )
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
@@ -11023,7 +11151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
                 )
-                if should_notify:
+                if should_notify and not _suppress_internal_group_output:
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         if reset_reason == "suspended":
@@ -11459,7 +11587,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
                                         try:
                                             _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
+                                            if (
+                                                not _suppress_internal_group_output
+                                                and _adapter
+                                                and source.chat_id
+                                            ):
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -11483,7 +11615,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
                                         try:
                                             _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
+                                            if (
+                                                not _suppress_internal_group_output
+                                                and _adapter
+                                                and source.chat_id
+                                            ):
                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -11563,7 +11699,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"Type {sethome_cmd} to make this chat your home channel, "
                     f"or ignore to skip."
                 )
-                await self._deliver_platform_notice(source, notice)
+                if not _suppress_internal_group_output:
+                    await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — inject current voice channel state
@@ -11675,6 +11812,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                suppress_internal_group_output=_suppress_internal_group_output,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -11762,7 +11900,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform,
+                    response,
+                    suppress_operational_failures=_suppress_internal_group_output,
+                )
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -16971,6 +17113,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        suppress_internal_group_output: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16989,6 +17132,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                suppress_internal_group_output=suppress_internal_group_output,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -17000,6 +17144,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                suppress_internal_group_output=suppress_internal_group_output,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -17032,6 +17177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        suppress_internal_group_output: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17068,6 +17214,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        _suppress_internal_group_output = suppress_internal_group_output
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -17959,7 +18106,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
+            if (
+                _suppress_internal_group_output
+                or not _status_adapter
+                or not _run_still_current()
+            ):
                 return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
@@ -18374,7 +18525,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # None callback — so _thinking scratch bubbles never relayed even
             # though the progress queue was created for them.
             agent.tool_progress_callback = (
-                progress_callback if (needs_progress_queue or log_mode_enabled) else None
+                None
+                if _suppress_internal_group_output
+                else (
+                    progress_callback
+                    if (needs_progress_queue or log_mode_enabled)
+                    else None
+                )
             )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
@@ -18383,8 +18540,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
-            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.interim_assistant_callback = (
+                None
+                if _suppress_internal_group_output
+                else (_interim_assistant_cb if _want_interim_messages else None)
+            )
+            agent.status_callback = (
+                None if _suppress_internal_group_output else _status_callback_sync
+            )
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
             # standalone push: render to a single plaintext line and deliver via
@@ -18398,7 +18561,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # clear). The clear callback is a no-op: a sent platform message
             # can't be cleanly retracted, and the band already fired once.
             def _notice_callback_sync(notice) -> None:
-                if not _status_adapter or not _run_still_current():
+                if (
+                    _suppress_internal_group_output
+                    or not _status_adapter
+                    or not _run_still_current()
+                ):
                     return
                 try:
                     line = render_notice_line(notice)
@@ -18414,7 +18581,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="notice_callback delivery scheduling error",
                 )
 
-            agent.notice_callback = _notice_callback_sync
+            agent.notice_callback = (
+                None if _suppress_internal_group_output else _notice_callback_sync
+            )
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
@@ -18426,7 +18595,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if (
+                    _suppress_internal_group_output
+                    or not _status_adapter
+                    or not _run_still_current()
+                ):
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
@@ -18449,7 +18622,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if (
+                    _suppress_internal_group_output
+                    or not _status_adapter
+                    or not _run_still_current()
+                ):
                     return
                 if not _bg_review_release.is_set():
                     with _bg_review_pending_lock:
@@ -18458,7 +18635,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = (
+                None if _suppress_internal_group_output else _bg_review_send
+            )
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
@@ -19074,8 +19253,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 final_response = _normalize_empty_agent_response(
                     result, final_response or "", history_len=len(agent_history),
                 )
-                final_response = _sanitize_gateway_final_response(source.platform, final_response)
-                if not final_response:
+                final_response = _sanitize_gateway_final_response(
+                    source.platform,
+                    final_response,
+                    suppress_operational_failures=_suppress_internal_group_output,
+                )
+                if not final_response and not _suppress_internal_group_output:
                     final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": final_response,
@@ -19374,7 +19557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
             allow_generic=True,
         )
-        if _long_running_mode == "off":
+        if _long_running_mode == "off" or _suppress_internal_group_output:
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
@@ -19563,8 +19746,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
                     # Staged warning: fire once before escalating to full timeout.
-                    if (not _warning_fired and _agent_warning is not None
-                            and _idle_secs >= _agent_warning):
+                    if (
+                        not _suppress_internal_group_output
+                        and not _warning_fired
+                        and _agent_warning is not None
+                        and _idle_secs >= _agent_warning
+                    ):
                         _warning_fired = True
                         _warn_adapter = self._adapter_for_source(source)
                         if _warn_adapter:
@@ -19859,7 +20046,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
-                    first_response = result.get("final_response", "")
+                    first_response = _sanitize_gateway_final_response(
+                        source.platform,
+                        result.get("final_response", ""),
+                        suppress_operational_failures=_suppress_internal_group_output,
+                    )
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
                         first_response,
@@ -19979,6 +20170,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                _followup_suppress_internal_output = (
+                    await _resolve_whatsapp_group_output_suppression(
+                        self._adapter_for_source(next_source),
+                        next_source,
+                        user_config,
+                    )
+                )
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -19990,6 +20188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    suppress_internal_group_output=_followup_suppress_internal_output,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -1224,6 +1224,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         "name": data.get("name", chat_id),
                         "type": "group" if data.get("isGroup") else "dm",
                         "participants": data.get("participants", []),
+                        "bot_ids": data.get("botIds", []),
                     }
         except Exception as e:
             logger.debug("Could not get WhatsApp chat info for %s: %s", chat_id, e)
