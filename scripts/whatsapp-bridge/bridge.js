@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
+import { createOutboundExposureGuard } from './outbound_exposure_guard.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
@@ -122,6 +123,7 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 //     (#33360) — the WhatsApp protocol-level routing can misdeliver when
 //     two sendMessage() Promises race on the same socket. ---
 let _sendQueue = Promise.resolve();
+const outboundExposureGuard = createOutboundExposureGuard();
 
 function enqueueSend(fn) {
   const task = _sendQueue.then(() => fn(), () => fn());
@@ -134,17 +136,18 @@ function sleep(ms) {
 }
 
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
-      timeoutMs,
-    );
+  return enqueueSend(async () => {
+    await outboundExposureGuard.beforeSend(chatId, payload);
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+        timeoutMs,
+      );
+    });
+    return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
+      .finally(() => clearTimeout(timer));
   });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
-      .finally(() => clearTimeout(timer))
-  );
 }
 
 function formatOutgoingMessage(message) {
