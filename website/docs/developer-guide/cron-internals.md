@@ -265,6 +265,12 @@ By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
 - A header identifying the cron job name and task
 - A footer noting the agent cannot see the delivered message in conversation
 
+Wrapping applies only to successful job output. Failed runs bypass the normal
+delivery target and use `cron.failure_deliver` (`local` by default). Only the
+bounded sanitized summary is eligible for the dedicated technical channel; the
+raw failure remains local. The failure path forces wrapping and transcript
+mirroring off.
+
 The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful for jobs that only need to write to files or perform side effects.
 
 ### Session Isolation

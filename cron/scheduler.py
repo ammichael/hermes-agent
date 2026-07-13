@@ -1548,7 +1548,15 @@ def _is_dm_delivery_target(
     return False
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    wrap_response_override: Optional[bool] = None,
+    mirror_delivery_override: Optional[bool] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1595,6 +1603,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
+    if wrap_response_override is not None:
+        wrap_response = bool(wrap_response_override)
+
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
@@ -1619,6 +1630,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        if mirror_delivery_override is not None:
+            mirror_enabled = bool(mirror_delivery_override)
         mirror_scope = _cron_mirror_delivery_scope(user_cfg)
     except Exception:
         mirror_enabled = False
@@ -2164,6 +2177,76 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+def _resolve_cron_failure_deliver(cfg: Optional[dict] = None) -> str:
+    """Return the dedicated destination for cron failure summaries.
+
+    Failure diagnostics must never inherit a job's normal delivery target: a
+    community/product group is an audience for domain output, not for host
+    paths, provider errors, or scheduler internals.  The operator may configure
+    one explicit technical destination with ``cron.failure_deliver``.  Missing,
+    malformed, broadcast, or origin-relative values fail closed to ``local``.
+
+    Raw errors are always persisted in cron output/logs.  Only the compact
+    summary from :func:`_summarize_cron_failure_for_delivery` may leave the host.
+    """
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        raw = (cfg.get("cron", {}) or {}).get("failure_deliver", "local")
+    except Exception:
+        return "local"
+
+    target = _normalize_deliver_value(raw)
+    if target in {"", "origin", "all"}:
+        return "local"
+    if target == "local":
+        return target
+    # External failure routing must be explicit (``platform:chat_id``).  Bare
+    # platform/home-channel aliases are too easy to misroute after migrations.
+    if ":" not in target:
+        return "local"
+    return target
+
+
+def _deliver_cron_failure(
+    job: dict,
+    content: str,
+    *,
+    adapters=None,
+    loop=None,
+    cfg: Optional[dict] = None,
+) -> Optional[str]:
+    """Route a sanitized failure summary only to the technical channel.
+
+    The ephemeral job copy deliberately drops origin/session attachment and
+    forces an unwrapped delivery.  This prevents leaking the source group's
+    identity, job ID, management footer, or failure details into either the
+    normal audience or a mirrored chat transcript.
+    """
+    failure_deliver = _resolve_cron_failure_deliver(cfg)
+    if failure_deliver == "local":
+        logger.info(
+            "Job '%s': failure kept local (cron.failure_deliver is local/unset)",
+            job.get("id", "?"),
+        )
+        return None
+
+    failure_job = dict(job)
+    failure_job.update({
+        "deliver": failure_deliver,
+        "origin": None,
+        "attach_to_session": False,
+    })
+    return _deliver_result(
+        failure_job,
+        content,
+        adapters=adapters,
+        loop=loop,
+        wrap_response_override=False,
+        mirror_delivery_override=False,
+    )
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -3704,9 +3787,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     "(tool subprocess was killed mid-flight)."
                 )
 
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
+            # Deliver successful output to the job's normal audience. Failure
+            # summaries are isolated from that audience and go only to the
+            # configured technical channel (or stay local, fail-closed).
+            # If the agent responded with [SILENT], skip successful delivery
+            # (output is already saved above). Failed runs still produce a
+            # summary, but only through the isolated technical failure route.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
@@ -3724,7 +3810,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if success:
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop,
+                        )
+                    else:
+                        delivery_error = _deliver_cron_failure(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

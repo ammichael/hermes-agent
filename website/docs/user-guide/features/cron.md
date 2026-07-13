@@ -298,6 +298,30 @@ cron:
   wrap_response: false
 ```
 
+### Failure delivery isolation
+
+Failed runs never inherit the job's normal delivery destination. Raw errors,
+stack traces, local paths, and provider payloads remain in local cron output and
+logs. By default, no failure message leaves the host:
+
+```yaml
+cron:
+  failure_deliver: local
+```
+
+Operators can route a compact sanitized failure summary to one explicit
+technical channel:
+
+```yaml
+cron:
+  failure_deliver: "telegram:<operations-chat-id>"
+```
+
+Use an explicit `platform:chat_id` target. `origin`, `all`, and bare platform
+aliases fail closed to `local`, so a product/community group cannot receive
+scheduler diagnostics by accident. Failure summaries are always unwrapped and
+are not mirrored into conversation history.
+
 ### Continuable jobs (reply to a cron delivery)
 
 By default a cron delivery is fire-and-forget: the message is sent, but it does

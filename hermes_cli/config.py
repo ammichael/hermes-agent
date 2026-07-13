@@ -2664,6 +2664,12 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Cron failures never inherit the job's normal delivery destination.
+        # Raw diagnostics stay in local output/logs. Set one explicit technical
+        # target (for example ``whatsapp:<ops-group-jid>``) to receive only a
+        # compact sanitized summary. ``local`` is the secure fail-closed default;
+        # ``origin``, ``all``, and bare platform aliases are rejected.
+        "failure_deliver": "local",
         # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
         # and the agent has it in context (no "what is Task #2?" amnesia).
         # Default False preserves the historical isolation guarantee (cron

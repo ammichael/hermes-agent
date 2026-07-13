@@ -221,7 +221,7 @@ class TestRunOneJobHonoursInterruptedFlag:
                  return_value="This run was interrupted.",
              ) as mock_summarize, \
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
-             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler._deliver_cron_failure", return_value=None) as mock_deliver, \
              patch("cron.scheduler.mark_job_run"):
             result = sched.run_one_job(job)
 

@@ -12,9 +12,11 @@ import pytest
 from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
+    _deliver_cron_failure,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_failure_deliver,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -51,6 +53,104 @@ class TestCronFailureDeliveryPrivacy:
 
         assert "[local path]" in message
         assert "example" not in message
+
+    @pytest.mark.parametrize(
+        "configured",
+        [None, "", "local", "origin", "all", "whatsapp"],
+    )
+    def test_failure_destination_fails_closed_to_local(self, configured):
+        cron_cfg = {} if configured is None else {"failure_deliver": configured}
+
+        assert _resolve_cron_failure_deliver({"cron": cron_cfg}) == "local"
+
+    def test_failure_destination_requires_explicit_technical_target(self):
+        target = "whatsapp:ops-group@example"
+
+        assert _resolve_cron_failure_deliver(
+            {"cron": {"failure_deliver": target}}
+        ) == target
+
+    def test_failure_delivery_never_uses_normal_target_or_wrapper(self):
+        job = {
+            "id": "private-job-id",
+            "name": "Community monitor",
+            "deliver": "whatsapp:community-group@example",
+            "origin": {"platform": "whatsapp", "chat_id": "community-group@example"},
+            "attach_to_session": True,
+        }
+        summary = _summarize_cron_failure_for_delivery(
+            job,
+            "Script not found: /Users/example/.hermes/scripts/private-monitor.py",
+        )
+
+        with patch("cron.scheduler._deliver_result", return_value=None) as deliver:
+            result = _deliver_cron_failure(
+                job,
+                summary,
+                cfg={"cron": {"failure_deliver": "whatsapp:ops-group@example"}},
+            )
+
+        assert result is None
+        deliver.assert_called_once()
+        routed_job, routed_content = deliver.call_args.args[:2]
+        assert routed_job["deliver"] == "whatsapp:ops-group@example"
+        assert routed_job["deliver"] != job["deliver"]
+        assert routed_job["origin"] is None
+        assert routed_job["attach_to_session"] is False
+        assert deliver.call_args.kwargs["wrap_response_override"] is False
+        assert deliver.call_args.kwargs["mirror_delivery_override"] is False
+        assert "private-job-id" not in routed_content
+        assert "/Users/" not in routed_content
+        assert ".hermes" not in routed_content
+
+    def test_local_failure_destination_performs_no_external_delivery(self):
+        job = {"id": "job", "name": "Monitor", "deliver": "whatsapp:group@example"}
+
+        with patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                "sanitized summary",
+                cfg={"cron": {"failure_deliver": "local"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_failure_delivery_reaches_only_ops_without_internal_wrapper(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        job = {
+            "id": "sensitive-job-id",
+            "name": "Community monitor",
+            "deliver": "telegram:community-room",
+            "origin": {"platform": "telegram", "chat_id": "community-room"},
+        }
+        summary = "⚠️ Community monitor failed. Details saved locally."
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send:
+            result = _deliver_cron_failure(
+                job,
+                summary,
+                cfg={"cron": {"failure_deliver": "telegram:ops-room"}},
+            )
+
+        assert result is None
+        send.assert_called_once()
+        args = send.call_args.args
+        assert args[2] == "ops-room"
+        assert args[2] != "community-room"
+        assert args[3] == summary
+        assert "Cronjob Response" not in args[3]
+        assert "job_id" not in args[3]
+        assert "To stop or manage" not in args[3]
 
 
 class TestPerJobToolsetMcpMerge:
@@ -2626,16 +2726,19 @@ class TestSilentDelivery:
         assert not sil("")
         assert not sil("   \n\t ")
 
-    def test_failed_job_always_delivers(self):
-        """Failed jobs deliver regardless of [SILENT] in output."""
+    def test_failed_job_routes_only_to_failure_destination(self):
+        """Failures bypass the normal audience even when the response is empty."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler._deliver_result") as normal_delivery, \
+             patch("cron.scheduler._deliver_cron_failure") as failure_delivery, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_called_once()
+        normal_delivery.assert_not_called()
+        failure_delivery.assert_called_once()
+        assert "some error" in failure_delivery.call_args.args[1]
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
