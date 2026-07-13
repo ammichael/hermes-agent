@@ -1521,6 +1521,8 @@ def _is_dm_delivery_target(
         return not target_id.endswith("@chatroom")
     if target_platform == "bluebubbles":
         return ";+;" not in target_id
+    if target_platform == "matrix":
+        return target_id.startswith("@")
     return False
 
 

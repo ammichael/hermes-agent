@@ -395,6 +395,33 @@ def test_self_heals_missing_provider_from_codex_cli(tmp_path, monkeypatch, caplo
     assert "fresh-refresh" not in caplog.text
 
 
+def test_empty_provider_does_not_import_cli_or_recurse(tmp_path, monkeypatch):
+    """A present-but-empty provider remains authoritative and fails cleanly."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {"openai-codex": {}},
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {
+            "access_token": "cli-access-token",
+            "refresh_token": "cli-refresh-token",
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with pytest.raises(auth.AuthError) as exc_info:
+        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert exc_info.value.code == "codex_auth_missing"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"] == {}
+
+
 def test_incomplete_singleton_prefers_usable_pool_over_codex_cli(tmp_path, monkeypatch):
     """An incomplete singleton must not bypass a usable Hermes pool credential."""
     hermes_home = tmp_path / "hermes"

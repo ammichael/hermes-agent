@@ -36,6 +36,17 @@ def test_mirror_scope_accepts_target():
     ) == "target"
 
 
+def test_matrix_target_classification_distinguishes_user_from_room():
+    from cron.scheduler import _is_dm_delivery_target
+
+    assert _is_dm_delivery_target(
+        {}, "matrix", "@alice:example.org", None, None, "matrix-target"
+    ) is True
+    assert _is_dm_delivery_target(
+        {}, "matrix", "!room:example.org", None, None, "matrix-target"
+    ) is False
+
+
 def test_target_scope_seeds_explicit_whatsapp_cloud_group_for_origin_user():
     from cron.scheduler import _deliver_result
     from gateway.config import Platform

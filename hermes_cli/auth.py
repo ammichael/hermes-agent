@@ -3435,8 +3435,13 @@ def _recover_missing_codex_provider_from_cli() -> Tuple[Optional[Dict[str, str]]
         pool_token = _pool_codex_access_token()
         pool_quota = _codex_pool_rate_limit_status()
         provider_absent = state is None
-        if singleton_usable or pool_token or pool_quota or not provider_absent:
+        if singleton_usable or pool_token or pool_quota:
             return None, True
+        if not provider_absent:
+            # A malformed/empty provider is still authoritative and must not
+            # be overwritten from CODEX_HOME. It also is not evidence that a
+            # concurrent usable state appeared, so do not recurse forever.
+            return None, False
 
         # Reentrant lock: _save_codex_tokens reloads the same store while no
         # other cooperating Hermes process can write, making check+persist atomic.
