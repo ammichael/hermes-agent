@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import (
+    _KNOWN_DELIVERY_PLATFORMS,
     SILENT_MARKER,
     _build_job_prompt,
     _cron_output_privacy_violation,
@@ -19,6 +20,7 @@ from cron.scheduler import (
     _resolve_cron_enabled_toolsets,
     _resolve_cron_failure_deliver,
     _resolve_delivery_target,
+    _resolve_delivery_targets,
     _resolve_origin,
     _send_media_via_adapter,
     _summarize_cron_failure_for_delivery,
@@ -28,14 +30,63 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+_VALID_FAILURE_TARGETS_BY_PLATFORM = {
+    "telegram": "telegram:-100123456789",
+    "discord": "discord:123456789012345678",
+    "slack": "slack:C0123ABCD45",
+    "whatsapp": "whatsapp:123456789@g.us",
+    "signal": "signal:+15551234567",
+    "matrix": "matrix:!ops:example.org",
+    "mattermost": "mattermost:opaque-channel_id-123",
+    "homeassistant": "homeassistant:notify.mobile_app_ops",
+    "dingtalk": "dingtalk:conversation$opaque",
+    "feishu": "feishu:oc_ops123",
+    "wecom": "wecom:opaque-room-id",
+    "wecom_callback": "wecom_callback:opaque-room-id",
+    "weixin": "weixin:wxid_ops123",
+    "sms": "sms:+15551234567",
+    "email": "email:ops@example.org",
+    "webhook": "webhook:ops-endpoint-id",
+    "bluebubbles": "bluebubbles:chat-guid:opaque",
+    "qqbot": "qqbot:opaque-channel-id",
+    "yuanbao": "yuanbao:group:123456",
+}
+
+
 class TestCronFailureDeliveryPrivacy:
+    @pytest.mark.parametrize(
+        ("error", "category"),
+        [
+            ("provider returned 429 with secret payload", "rate limit"),
+            ("ReadTimeout at /Volumes/private/data", "timeout"),
+            ("HTTP 401 for personal@example.com", "authentication"),
+            ("Script not found: /opt/private/job.py", "missing dependency"),
+            ("Interrupted by gateway shutdown", "interrupted"),
+            ("Agent completed but produced empty response", "empty response"),
+            ("token=secret MEDIA:/tmp/private.png", "execution error"),
+        ],
+    )
+    def test_failure_summary_is_closed_and_contains_no_arbitrary_input(self, error, category):
+        message = _summarize_cron_failure_for_delivery(
+            {"id": "private-id", "name": "MEDIA:/Volumes/private/job"}, error,
+        )
+
+        assert category in message
+        assert "private-id" not in message
+        assert "MEDIA:" not in message
+        assert "/Volumes" not in message
+        assert "/opt" not in message
+        assert "/tmp" not in message
+        assert "personal@example.com" not in message
+        assert "secret" not in message
+
     def test_missing_script_does_not_expose_local_path(self):
         message = _summarize_cron_failure_for_delivery(
             {"name": "Daily monitor"},
             "Script not found: /Users/example/.hermes/scripts/private-monitor.py",
         )
 
-        assert "required script is missing" in message
+        assert "missing dependency" in message
         assert "/Users/" not in message
         assert ".hermes" not in message
 
@@ -52,12 +103,24 @@ class TestCronFailureDeliveryPrivacy:
             {"name": "Daily monitor"}, error,
         )
 
-        assert "[local path]" in message
+        assert "execution error" in message
         assert "example" not in message
 
     @pytest.mark.parametrize(
         "configured",
-        [None, "", "local", "origin", "all", "whatsapp"],
+        [
+            None,
+            "",
+            "local",
+            "origin",
+            "all",
+            "whatsapp",
+            "whatsapp:ops,telegram:ops",
+            "whatsapp:",
+            "whatsapp:ops\ntelegram:other",
+            "telegram:Operations Team",
+            "unknown:123",
+        ],
     )
     def test_failure_destination_fails_closed_to_local(self, configured):
         cron_cfg = {} if configured is None else {"failure_deliver": configured}
@@ -65,8 +128,17 @@ class TestCronFailureDeliveryPrivacy:
         assert _resolve_cron_failure_deliver({"cron": cron_cfg}) == "local"
 
     def test_failure_destination_requires_explicit_technical_target(self):
-        target = "whatsapp:ops-group@example"
+        target = "whatsapp:123456789@g.us"
 
+        assert _resolve_cron_failure_deliver(
+            {"cron": {"failure_deliver": target}}
+        ) == target
+
+    def test_failure_target_matrix_covers_every_builtin_platform(self):
+        assert set(_VALID_FAILURE_TARGETS_BY_PLATFORM) == set(_KNOWN_DELIVERY_PLATFORMS)
+
+    @pytest.mark.parametrize("target", _VALID_FAILURE_TARGETS_BY_PLATFORM.values())
+    def test_failure_destination_accepts_explicit_ids_for_every_builtin_platform(self, target):
         assert _resolve_cron_failure_deliver(
             {"cron": {"failure_deliver": target}}
         ) == target
@@ -75,8 +147,8 @@ class TestCronFailureDeliveryPrivacy:
         job = {
             "id": "private-job-id",
             "name": "Community monitor",
-            "deliver": "whatsapp:community-group@example",
-            "origin": {"platform": "whatsapp", "chat_id": "community-group@example"},
+            "deliver": "whatsapp:987654321@g.us",
+            "origin": {"platform": "whatsapp", "chat_id": "987654321@g.us"},
             "attach_to_session": True,
         }
         summary = _summarize_cron_failure_for_delivery(
@@ -88,16 +160,17 @@ class TestCronFailureDeliveryPrivacy:
             result = _deliver_cron_failure(
                 job,
                 summary,
-                cfg={"cron": {"failure_deliver": "whatsapp:ops-group@example"}},
+                cfg={"cron": {"failure_deliver": "whatsapp:123456789@g.us"}},
             )
 
         assert result is None
         deliver.assert_called_once()
         routed_job, routed_content = deliver.call_args.args[:2]
-        assert routed_job["deliver"] == "whatsapp:ops-group@example"
+        assert routed_job["deliver"] == "whatsapp:123456789@g.us"
         assert routed_job["deliver"] != job["deliver"]
         assert routed_job["origin"] is None
         assert routed_job["attach_to_session"] is False
+        assert routed_job["_skip_channel_directory_resolution"] is True
         assert deliver.call_args.kwargs["wrap_response_override"] is False
         assert deliver.call_args.kwargs["mirror_delivery_override"] is False
         assert "private-job-id" not in routed_content
@@ -117,6 +190,145 @@ class TestCronFailureDeliveryPrivacy:
         assert result is None
         deliver.assert_not_called()
 
+    def test_failure_destination_matching_normal_audience_is_blocked_even_across_threads(self):
+        job = {
+            "id": "job",
+            "name": "Monitor",
+            "deliver": "telegram:-100123:17",
+        }
+
+        with patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                "sanitized summary",
+                cfg={"cron": {"failure_deliver": "telegram:-100123:99"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_unresolved_origin_normal_audience_blocks_technical_delivery(self):
+        job = {"id": "job", "deliver": "origin", "origin": None}
+
+        with patch("cron.scheduler._iter_home_target_platforms", return_value=iter(())), \
+             patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                _summarize_cron_failure_for_delivery(job, "timeout"),
+                cfg={"cron": {"failure_deliver": "telegram:-100123456789"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"id": "job", "deliver": "slack:#ops"},
+            {
+                "id": "job",
+                "deliver": "origin",
+                "origin": {"platform": "slack", "chat_id": "#ops"},
+            },
+        ],
+    )
+    def test_unresolved_strict_alias_blocks_technical_delivery(self, job):
+        with patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                _summarize_cron_failure_for_delivery(job, "timeout"),
+                cfg={"cron": {"failure_deliver": "slack:C0123ABCD45"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_home_alias_without_canonical_resolution_blocks_technical_delivery(self, monkeypatch):
+        monkeypatch.setenv("SLACK_HOME_CHANNEL", "#ops")
+        job = {"id": "job", "deliver": "slack"}
+
+        with patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                _summarize_cron_failure_for_delivery(job, "timeout"),
+                cfg={"cron": {"failure_deliver": "slack:C0123ABCD45"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_resolved_alias_matching_technical_chat_is_blocked(self):
+        job = {"id": "job", "deliver": "slack:#ops"}
+
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0123ABCD45",
+        ), patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                _summarize_cron_failure_for_delivery(job, "timeout"),
+                cfg={"cron": {"failure_deliver": "slack:C0123ABCD45"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_partially_unresolved_fanout_blocks_technical_delivery(self):
+        job = {
+            "id": "job",
+            "deliver": "telegram:-100987654321,not-a-platform",
+        }
+
+        with patch("cron.scheduler._deliver_result") as deliver:
+            result = _deliver_cron_failure(
+                job,
+                _summarize_cron_failure_for_delivery(job, "timeout"),
+                cfg={"cron": {"failure_deliver": "telegram:-100123456789"}},
+            )
+
+        assert result is None
+        deliver.assert_not_called()
+
+    def test_failure_delivery_replaces_non_allowlisted_content(self):
+        job = {"id": "job", "deliver": "local"}
+
+        with patch("cron.scheduler._deliver_result", return_value=None) as deliver:
+            _deliver_cron_failure(
+                job,
+                "token=secret MEDIA:/Volumes/private/file",
+                cfg={"cron": {"failure_deliver": "telegram:-100123456789"}},
+            )
+
+        deliver.assert_called_once()
+        routed_content = deliver.call_args.args[1]
+        assert "execution error" in routed_content
+        assert "secret" not in routed_content
+        assert "MEDIA:" not in routed_content
+        assert "/Volumes" not in routed_content
+
+    def test_technical_target_bypasses_channel_directory_resolution(self):
+        failure_job = {
+            "id": "job",
+            "deliver": "telegram:-100123456789",
+            "origin": None,
+            "_skip_channel_directory_resolution": True,
+        }
+
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="-100999999999",
+        ) as directory_resolve:
+            targets = _resolve_delivery_targets(failure_job)
+
+        directory_resolve.assert_not_called()
+        assert targets == [{
+            "platform": "telegram",
+            "chat_id": "-100123456789",
+            "thread_id": None,
+        }]
+
     def test_failure_delivery_reaches_only_ops_without_internal_wrapper(self):
         from gateway.config import Platform
 
@@ -127,12 +339,16 @@ class TestCronFailureDeliveryPrivacy:
         job = {
             "id": "sensitive-job-id",
             "name": "Community monitor",
-            "deliver": "telegram:community-room",
-            "origin": {"platform": "telegram", "chat_id": "community-room"},
+            "deliver": "telegram:-100987654321",
+            "origin": {"platform": "telegram", "chat_id": "-100987654321"},
         }
-        summary = "⚠️ Community monitor failed. Details saved locally."
+        summary = _summarize_cron_failure_for_delivery(job, "provider timeout")
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch(
+                 "cron.scheduler._failure_delivery_overlaps_normal_audience",
+                 return_value=False,
+             ), \
              patch(
                  "tools.send_message_tool._send_to_platform",
                  new=AsyncMock(return_value={"success": True}),
@@ -140,14 +356,14 @@ class TestCronFailureDeliveryPrivacy:
             result = _deliver_cron_failure(
                 job,
                 summary,
-                cfg={"cron": {"failure_deliver": "telegram:ops-room"}},
+                cfg={"cron": {"failure_deliver": "telegram:-100123456789"}},
             )
 
         assert result is None
         send.assert_called_once()
         args = send.call_args.args
-        assert args[2] == "ops-room"
-        assert args[2] != "community-room"
+        assert args[2] == "-100123456789"
+        assert args[2] != "-100987654321"
         assert args[3] == summary
         assert "Cronjob Response" not in args[3]
         assert "job_id" not in args[3]
@@ -2762,7 +2978,9 @@ class TestSilentDelivery:
             tick(verbose=False)
         normal_delivery.assert_not_called()
         failure_delivery.assert_called_once()
-        assert "some error" in failure_delivery.call_args.args[1]
+        summary = failure_delivery.call_args.args[1]
+        assert "execution error" in summary
+        assert "some error" not in summary
 
     def test_zero_exit_operational_log_is_blocked_from_normal_audience(self):
         job = self._make_job()

@@ -49,79 +49,56 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+_CRON_FAILURE_DELIVERY_CATEGORIES = frozenset({
+    "rate limit",
+    "timeout",
+    "authentication",
+    "missing dependency",
+    "interrupted",
+    "empty response",
+    "execution error",
+})
+
+_STRICT_EXPLICIT_DELIVERY_PLATFORMS = frozenset({
+    "telegram", "discord", "slack", "whatsapp", "signal", "matrix",
+    "feishu", "weixin", "sms", "email", "yuanbao",
+})
+
+
+def _cron_failure_delivery_message(category: str) -> str:
+    if category not in _CRON_FAILURE_DELIVERY_CATEGORIES:
+        category = "execution error"
+    return f"⚠️ A scheduled job failed ({category}). Check the local cron dashboard."
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """Return a compact one-line failure message for chat delivery.
+    """Return a fixed, allowlisted failure summary for an operational channel.
 
-    Full details stay in the cron output directory and the logs. Chat should
-    show the operator what broke without dumping provider JSON, retry noise, or
-    stack traces into the delivery channel.
+    ``job`` and ``error`` are untrusted disclosure inputs: names may contain
+    paths or PII, while exceptions may contain credentials, provider payloads,
+    URLs, media directives, and arbitrary multiline text.  They are used only
+    to choose a closed category; no source text is copied into the message.
+    Full details remain in local cron output and logs.
     """
-    job_name = job.get("name") or job.get("id") or "cron job"
-    text = (error or "unknown error").strip()
-    lower = text.lower()
+    del job  # Deliberately excluded from externally visible text.
+    text = (error or "").lower()[:2000]
 
-    # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
-        reason = "rate limit"
-        if "weekly usage limit" in lower:
-            reason = "weekly usage limit"
-        elif "quota" in lower:
-            reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
-        )
+    if "429" in text or "rate limit" in text or "usage limit" in text or "quota" in text:
+        category = "rate limit"
+    elif "readtimeout" in text or "timed out" in text or "timeout" in text:
+        category = "timeout"
+    elif re.search(r"authenticat|authoriz", text) or re.search(r"\b(401|403)\b", text):
+        category = "authentication"
+    elif "script not found:" in text or "script path is not a file:" in text:
+        category = "missing dependency"
+    elif "interrupt" in text or "shutdown" in text:
+        category = "interrupted"
+    elif "empty response" in text or "produced nothing" in text:
+        category = "empty response"
+    else:
+        category = "execution error"
 
-    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
-        )
-
-    # Match authentication/authorization wording at a word boundary and the
-    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
-        )
-
-    # Script setup failures commonly contain an absolute local path.  That is
-    # useful in logs, but it leaks usernames, home-directory layout, and other
-    # host details when delivered to a chat.  Keep the user-facing diagnosis
-    # actionable while the original error remains available in cron output.
-    if "script not found:" in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: required script is missing. "
-            "Full details saved in cron output."
-        )
-    if "script path is not a file:" in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: required script is unavailable. "
-            "Full details saved in cron output."
-        )
-
-    # Strip common exception wrappers and collapse provider payloads. Bound
-    # the input first so a multi-KB provider blob cannot slow the
-    # substitutions.
-    cleaned = re.sub(
-        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
-    )
-    # Defense in depth for miscellaneous failures: redact Unix/macOS and
-    # Windows absolute paths before the generic summary reaches any channel.
-    cleaned = re.sub(
-        r"(?<![A-Za-z0-9_])(?:/(?:Users|home|var|private|tmp)/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)",
-        "[local path]",
-        cleaned,
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    return _cron_failure_delivery_message(category)
 
 
 def _cron_output_privacy_violation(content: str | None) -> Optional[str]:
@@ -1224,20 +1201,23 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         else:
             chat_id, thread_id = rest, None
 
-        # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
-                if resolved_is_explicit:
-                    chat_id = parsed_chat_id
-                    if parsed_thread_id is not None:
-                        thread_id = parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
+        # Ordinary deliveries may resolve friendly labels. Security-sensitive
+        # technical routes set the internal skip flag and use the configured
+        # explicit ID verbatim.
+        if not job.get("_skip_channel_directory_resolution") and chat_id is not None:
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_key, str(chat_id))
+                if resolved:
+                    parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                    if resolved_is_explicit:
+                        chat_id = parsed_chat_id
+                        if parsed_thread_id is not None:
+                            thread_id = parsed_thread_id
+                    else:
+                        chat_id = resolved
+            except Exception:
+                pass
 
         return {
             "platform": platform_name,
@@ -2235,16 +2215,130 @@ def _resolve_cron_failure_deliver(cfg: Optional[dict] = None) -> str:
     except Exception:
         return "local"
 
-    target = _normalize_deliver_value(raw)
+    target = _normalize_deliver_value(raw).strip()
     if target in {"", "origin", "all"}:
         return "local"
     if target == "local":
         return target
-    # External failure routing must be explicit (``platform:chat_id``).  Bare
-    # platform/home-channel aliases are too easy to misroute after migrations.
-    if ":" not in target:
+    # External failure routing must be exactly one explicit
+    # ``platform:chat_id`` target. Broadcasts, control characters, empty
+    # components, and platform/home aliases fail closed.
+    if "," in target or any(ord(ch) < 32 or ord(ch) == 127 for ch in target):
+        return "local"
+    platform, separator, destination = target.partition(":")
+    if (
+        separator != ":"
+        or not destination.strip()
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", platform)
+        or not _is_known_delivery_platform(platform.lower())
+    ):
+        return "local"
+    try:
+        from tools.send_message_tool import _parse_target_ref
+
+        _chat_id, _thread_id, is_explicit = _parse_target_ref(
+            platform.lower(), destination,
+        )
+    except Exception:
+        return "local"
+    if is_explicit:
+        return target
+
+    # Some adapters intentionally use opaque IDs and have no grammar in the
+    # shared target parser. Because technical delivery bypasses the channel
+    # directory, a bounded non-whitespace value is still an explicit verbatim
+    # destination, not a friendly alias. Platforms with a strict parser must
+    # match it or fail closed.
+    if platform.lower() in _STRICT_EXPLICIT_DELIVERY_PLATFORMS:
+        return "local"
+    if len(destination) > 512 or any(ch.isspace() for ch in destination):
         return "local"
     return target
+
+
+def _resolved_delivery_target_is_canonical(target: dict) -> bool:
+    """Whether a resolved target has a canonical ID safe for audience checks."""
+    try:
+        platform = str(target["platform"]).lower()
+        chat_id = str(target["chat_id"])
+        thread_id = target.get("thread_id")
+        if not chat_id or len(chat_id) > 512 or any(ch.isspace() for ch in chat_id):
+            return False
+
+        from tools.send_message_tool import _parse_target_ref
+
+        target_ref = chat_id
+        if thread_id is not None:
+            separator = ":$" if platform == "matrix" else ":"
+            target_ref = f"{chat_id}{separator}{thread_id}"
+        _parsed_chat, _parsed_thread, is_explicit = _parse_target_ref(
+            platform, target_ref,
+        )
+        if is_explicit:
+            return True
+        return platform not in _STRICT_EXPLICIT_DELIVERY_PLATFORMS
+    except Exception:
+        return False
+
+
+def _resolve_normal_delivery_targets_fail_closed(job: dict) -> Optional[List[dict]]:
+    """Resolve every declared normal route once, or return None on ambiguity."""
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    if deliver == "local":
+        return []
+    raw_parts = [part.strip() for part in deliver.split(",") if part.strip()]
+    if not raw_parts:
+        return None
+
+    targets: List[dict] = []
+    seen = set()
+    for raw in raw_parts:
+        expanded = _expand_routing_tokens(raw)
+        if not expanded:
+            return None
+        for part in expanded:
+            target = _resolve_single_delivery_target(job, part)
+            if target is None or not _resolved_delivery_target_is_canonical(target):
+                return None
+            key = (
+                str(target["platform"]).lower(),
+                str(target["chat_id"]),
+                target.get("thread_id"),
+            )
+            if key not in seen:
+                seen.add(key)
+                targets.append(target)
+    return targets
+
+
+def _failure_delivery_overlaps_normal_audience(job: dict, failure_job: dict) -> bool:
+    """Fail closed when the technical destination shares a normal chat.
+
+    Threads are not separate privacy audiences: if either route resolves to the
+    same platform and chat ID, the failure notification stays local.
+    """
+    try:
+        normal_targets = _resolve_normal_delivery_targets_fail_closed(job)
+        if normal_targets is None:
+            return True
+        failure_targets = _resolve_delivery_targets(failure_job)
+        if len(failure_targets) != 1:
+            return True
+        failure_target = failure_targets[0]
+        failure_key = (
+            str(failure_target["platform"]).lower(),
+            str(failure_target["chat_id"]),
+        )
+        for target in normal_targets:
+            normal_key = (
+                str(target["platform"]).lower(),
+                str(target["chat_id"]),
+            )
+            if normal_key == failure_key:
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _deliver_cron_failure(
@@ -2270,12 +2364,33 @@ def _deliver_cron_failure(
         )
         return None
 
+    # Second disclosure boundary: future callers cannot bypass the summarizer
+    # and forward raw exception text through this helper.
+    allowed_messages = {
+        _cron_failure_delivery_message(category)
+        for category in _CRON_FAILURE_DELIVERY_CATEGORIES
+    }
+    if content not in allowed_messages:
+        logger.warning(
+            "Job '%s': replaced non-allowlisted technical failure content",
+            job.get("id", "?"),
+        )
+        content = _cron_failure_delivery_message("execution error")
+
     failure_job = dict(job)
     failure_job.update({
         "deliver": failure_deliver,
         "origin": None,
         "attach_to_session": False,
+        "_skip_channel_directory_resolution": True,
     })
+    if _failure_delivery_overlaps_normal_audience(job, failure_job):
+        logger.warning(
+            "Job '%s': failure kept local because the technical destination "
+            "is unresolved or overlaps the normal audience",
+            job.get("id", "?"),
+        )
+        return None
     return _deliver_result(
         failure_job,
         content,
@@ -3743,6 +3858,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    failure_notification_attempted = False
+    delivery_error = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3824,6 +3941,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # Classify an empty model response before routing. Otherwise the
+            # blank successful response skips delivery and only becomes a
+            # failure afterward, so the technical channel never learns about
+            # it.
+            if success and not final_response.strip():
+                success = False
+                error = (
+                    "Agent completed but produced empty response "
+                    "(model error, timeout, or misconfiguration)"
+                )
+
             # Deliver successful output to the job's normal audience. Failure
             # summaries are isolated from that audience and go only to the
             # configured technical channel (or stay local, fail-closed).
@@ -3869,6 +3997,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                             job, deliver_content, adapters=adapters, loop=loop,
                         )
                     else:
+                        failure_notification_attempted = True
                         delivery_error = _deliver_cron_failure(
                             job,
                             deliver_content,
@@ -3885,21 +4014,37 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
+        if not failure_notification_attempted:
+            failure_notification_attempted = True
+            try:
+                delivery_error = _deliver_cron_failure(
+                    job,
+                    _summarize_cron_failure_for_delivery(job, str(e)),
+                    adapters=adapters,
+                    loop=loop,
+                )
+            except Exception as delivery_exception:
+                delivery_error = str(delivery_exception)
+                logger.error(
+                    "Technical failure notification failed for job %s: %s",
+                    job["id"], delivery_exception,
+                )
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            try:
+                mark_job_run(
+                    job["id"], False, str(e), delivery_error=delivery_error,
+                )
+            except Exception as persist_exception:
+                logger.error(
+                    "Failed to persist cron failure state for job %s: %s",
+                    job["id"], persist_exception,
+                )
         return False
 
 

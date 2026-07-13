@@ -266,10 +266,14 @@ By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
 - A footer noting the agent cannot see the delivered message in conversation
 
 Wrapping applies only to successful job output. Failed runs bypass the normal
-delivery target and use `cron.failure_deliver` (`local` by default). Only the
-bounded sanitized summary is eligible for the dedicated technical channel; the
-raw failure remains local. The failure path forces wrapping and transcript
-mirroring off.
+delivery target and use `cron.failure_deliver` (`local` by default). Only a
+fixed message with an allowlisted failure category is eligible for the dedicated
+technical channel; job names, IDs, and raw exception text remain local. The
+failure path forces wrapping and transcript mirroring off, and blocks delivery
+when the technical destination resolves to the same chat as any normal target
+(threads are not treated as separate privacy audiences). Normal aliases,
+`origin`, home-channel routes, and fan-out must all resolve to canonical target
+IDs; any unresolved component keeps the failure local.
 
 The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful for jobs that only need to write to files or perform side effects.
 

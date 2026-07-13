@@ -309,18 +309,23 @@ cron:
   failure_deliver: local
 ```
 
-Operators can route a compact sanitized failure summary to one explicit
-technical channel:
+Operators can route a fixed summary with an allowlisted failure category to one
+explicit technical channel. The message never includes the job name, job ID, or
+raw exception text:
 
 ```yaml
 cron:
   failure_deliver: "telegram:<operations-chat-id>"
 ```
 
-Use an explicit `platform:chat_id` target. `origin`, `all`, and bare platform
-aliases fail closed to `local`, so a product/community group cannot receive
-scheduler diagnostics by accident. Failure summaries are always unwrapped and
-are not mirrored into conversation history.
+Use exactly one explicit `platform:chat_id` target. `origin`, `all`, fan-out,
+malformed targets, and bare platform aliases fail closed to `local`, so a
+product/community group cannot receive scheduler diagnostics by accident. A
+technical target that resolves to the same chat as any normal job target is
+also blocked, even when the thread IDs differ. If a normal alias, `origin`, home
+channel, or fan-out component cannot be resolved to a canonical target ID, the
+failure stays local. Failure summaries are always unwrapped and are not mirrored
+into conversation history.
 
 ### Continuable jobs (reply to a cron delivery)
 

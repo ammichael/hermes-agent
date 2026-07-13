@@ -31,12 +31,17 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
+    def fake_failure_deliver(job, content, adapters=None, loop=None):
+        calls.append(("failure_deliver", job["id"]))
+        return None
+
     def fake_mark(jid, ok, err=None, delivery_error=None):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", fake_save)
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+    monkeypatch.setattr(s, "_deliver_cron_failure", fake_failure_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
     return calls
 
@@ -88,16 +93,48 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     assert mark == ("mark", "j4", False)
 
 
-def test_run_one_job_failed_job_delivers_error(monkeypatch):
-    """A failed job still delivers (the error notice) and marks not-ok."""
+def test_run_one_job_failed_job_uses_isolated_failure_route(monkeypatch):
+    """A failed job never delivers its error to the normal audience."""
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
 
     s.run_one_job({"id": "j5", "name": "t"})
 
     kinds = [c[0] for c in calls]
-    assert "deliver" in kinds  # failures always deliver
+    assert "failure_deliver" in kinds
+    assert "deliver" not in kinds
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_run_one_job_empty_response_uses_isolated_failure_route(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, final="   ")
+
+    s.run_one_job({"id": "j-empty", "name": "t"})
+
+    kinds = [c[0] for c in calls]
+    assert "failure_deliver" in kinds
+    assert "deliver" not in kinds
+
+
+def test_run_one_job_exception_uses_isolated_failure_route(monkeypatch):
+    def boom(job, *, defer_agent_teardown=None):
+        raise RuntimeError("private /Volumes/path token=secret")
+
+    monkeypatch.setattr(s, "run_job", boom)
+    monkeypatch.setattr(s, "claim_dispatch", lambda _jid: True)
+    delivered = []
+    monkeypatch.setattr(
+        s,
+        "_deliver_cron_failure",
+        lambda job, content, adapters=None, loop=None: delivered.append(content),
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *args, **kwargs: None)
+
+    assert s.run_one_job({"id": "j-exception", "name": "private"}) is False
+    assert len(delivered) == 1
+    assert delivered[0].endswith("(execution error). Check the local cron dashboard.")
+    assert "/Volumes" not in delivered[0]
+    assert "secret" not in delivered[0]
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):
@@ -117,6 +154,39 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+def test_mark_failure_after_failed_run_does_not_duplicate_notification(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+    mark_attempts = []
+
+    def fail_mark(*args, **kwargs):
+        mark_attempts.append((args, kwargs))
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(s, "mark_job_run", fail_mark)
+
+    assert s.run_one_job({"id": "j-mark-failed", "name": "t"}) is False
+    assert [kind for kind, *_rest in calls].count("failure_deliver") == 1
+    assert [kind for kind, *_rest in calls].count("deliver") == 0
+    assert len(mark_attempts) == 2
+
+
+def test_mark_failure_after_success_notifies_once_and_stays_bounded(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=True, final="ok")
+    mark_attempts = []
+
+    def fail_mark(*args, **kwargs):
+        mark_attempts.append((args, kwargs))
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(s, "mark_job_run", fail_mark)
+
+    assert s.run_one_job({"id": "j-mark-success", "name": "t"}) is False
+    kinds = [kind for kind, *_rest in calls]
+    assert kinds.count("deliver") == 1
+    assert kinds.count("failure_deliver") == 1
+    assert len(mark_attempts) == 2
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
