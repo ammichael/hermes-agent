@@ -202,6 +202,36 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     agent.context_compressor.compress.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "source_title",
+    ["Títulos de Sessão", "Títulos de Sessão #2"],
+)
+def test_rotation_preserves_title_without_adding_lineage_suffix(
+    tmp_path: Path,
+    source_title: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "TITLE_TRANSFER_PARENT"
+    db.create_session(parent_sid, source="cli")
+    db.set_session_title(parent_sid, source_title)
+    agent = _build_agent_with_db(db, parent_sid)
+    messages = [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "working"},
+    ]
+
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    continuation_id = getattr(agent, "session_id")
+    assert continuation_id != parent_sid
+    continuation_title = db.get_session_title(continuation_id)
+    assert continuation_title is not None
+    assert continuation_title == source_title
+    if source_title == "Títulos de Sessão":
+        assert len(continuation_title.split()) == 3
+    assert db.get_session_title(parent_sid) is None
+
+
 def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path: Path) -> None:
     """Provider chat templates need at least one user message after compaction.
 

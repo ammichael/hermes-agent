@@ -855,11 +855,16 @@ def compress_context(
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
-                    # Auto-number the title for the continuation session
+                    # Transfer the exact title to the continuation.  The
+                    # SessionDB title setter atomically clears it from hidden
+                    # compression ancestors, preserving both uniqueness and
+                    # user-authored titles without adding a legacy " #N" suffix.
                     if old_title:
                         try:
-                            new_title = agent._session_db.get_next_title_in_lineage(old_title)
-                            agent._session_db.set_session_title(agent.session_id, new_title)
+                            agent._session_db.set_session_title(
+                                agent.session_id,
+                                old_title,
+                            )
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
