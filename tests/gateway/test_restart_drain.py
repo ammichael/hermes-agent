@@ -89,6 +89,48 @@ async def test_draining_rejects_new_session_messages():
     assert result == "⏳ Gateway is restarting and is not accepting new work right now."
 
 
+@pytest.mark.asyncio
+async def test_draining_is_silent_in_shared_whatsapp_group():
+    runner, _adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._should_suppress_internal_group_output = AsyncMock(return_value=True)
+
+    event = MessageEvent(
+        text="family conversation",
+        message_type=MessageType.TEXT,
+        source=make_restart_source("shared-group", chat_type="group"),
+        message_id="m-shared",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner._should_suppress_internal_group_output.assert_awaited_once_with(event.source)
+
+
+@pytest.mark.asyncio
+async def test_draining_active_session_is_silent_in_shared_whatsapp_group():
+    runner, _adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._should_suppress_internal_group_output = AsyncMock(return_value=True)
+
+    event = MessageEvent(
+        text="another family message",
+        message_type=MessageType.TEXT,
+        source=make_restart_source("active-shared-group", chat_type="group"),
+        message_id="m-active-shared",
+    )
+    session_key = build_session_key(event.source)
+    runner._running_agents[session_key] = MagicMock()
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner._should_suppress_internal_group_output.assert_awaited_once_with(event.source)
+
+
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)

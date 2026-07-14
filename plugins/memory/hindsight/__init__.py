@@ -539,6 +539,30 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         env_values["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(
             _parse_int_setting(idle_timeout, _DEFAULT_IDLE_TIMEOUT)
         )
+
+    # Preserve the complete local-embedded runtime contract when the profile
+    # env is regenerated. Without these mappings, an Ollama/OpenAI-compatible
+    # embeddings setup silently falls back to local Hugging Face models.
+    embedded_settings = {
+        "embeddings_provider": "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+        "embeddings_openai_api_key": "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
+        "embeddings_openai_model": "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL",
+        "embeddings_openai_base_url": "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL",
+        "embeddings_openai_dimensions": "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS",
+        "reranker_provider": "HINDSIGHT_API_RERANKER_PROVIDER",
+        "enable_observations": "HINDSIGHT_API_ENABLE_OBSERVATIONS",
+        "enable_auto_consolidation": "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION",
+        "worker_max_slots": "HINDSIGHT_API_WORKER_MAX_SLOTS",
+        "worker_consolidation_max_slots": "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+        "worker_retain_max_slots": "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
+        "worker_file_convert_retain_max_slots": "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS",
+        "llm_strict_schema": "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+    }
+    for config_key, env_key in embedded_settings.items():
+        value = config.get(config_key)
+        if value is None or value == "":
+            continue
+        env_values[env_key] = str(value).lower() if isinstance(value, bool) else str(value)
     return env_values
 
 
@@ -1050,6 +1074,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._idle_timeout = idle_timeout
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
+                # HindsightEmbedded accepts only a narrow constructor surface,
+                # while its daemon supports the additional settings above.
+                # Feed them to the daemon config before the first operation.
+                embedded_env = _build_embedded_profile_env(
+                    self._config or {},
+                    llm_api_key=kwargs.get("llm_api_key") or None,
+                )
+                self._client.config.update(embedded_env)
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight

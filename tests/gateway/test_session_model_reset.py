@@ -106,6 +106,20 @@ async def test_new_command_no_override_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_new_command_hides_runtime_details_in_shared_whatsapp_group():
+    runner = _make_runner()
+    runner._should_suppress_internal_group_output = AsyncMock(return_value=True)
+
+    result = await runner._handle_reset_command(_make_event("/new"))
+
+    text = str(getattr(result, "text", result))
+    assert text == "✓ Sessão reiniciada."
+    assert "Model:" not in text
+    assert "Provider:" not in text
+    assert "Context:" not in text
+
+
+@pytest.mark.asyncio
 async def test_new_command_only_clears_own_session():
     """/new must only clear the override for the session that triggered it."""
     runner = _make_runner()

@@ -325,6 +325,15 @@ class GatewaySlashCommandsMixin:
         except Exception:
             _tip_line = ""
 
+        # A shared WhatsApp group is not an operational console. The reset
+        # itself still succeeds, but model/provider/context/tip details must not
+        # be exposed to family members or other participants.
+        _audience_guard = getattr(
+            self, "_should_suppress_internal_group_output", None
+        )
+        if _audience_guard is not None and await _audience_guard(source):
+            return EphemeralReply("✓ Sessão reiniciada.")
+
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
         return EphemeralReply(f"{header}{_tip_line}")

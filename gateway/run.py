@@ -81,6 +81,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+compression\s+threshold"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
+    r"|pre-api\s+compression"
+    r"|near\s+the\s+context/output\s+limit"
+    r"|compacting\s+before\s+the\s+next\s+model\s+call"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
@@ -4503,6 +4506,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
+
+    async def _should_suppress_internal_group_output(self, source: SessionSource) -> bool:
+        """Fail closed for operational replies in shared WhatsApp groups.
+
+        Agent answers have a later audience check, but restart/drain and slash
+        command replies return before that boundary. Keep those runtime details
+        out of any WhatsApp group that is not provably the private Mike + N
+        workspace.
+        """
+        try:
+            user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
+        return await _resolve_whatsapp_group_output_suppression(
+            self._adapter_for_source(source),
+            source,
+            user_config,
+        )
 
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
@@ -9685,6 +9706,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._draining:
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
+                if await self._should_suppress_internal_group_output(source):
+                    logger.info(
+                        "Shared WhatsApp group: restart/drain status suppressed"
+                    )
+                    return None
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if self._queue_during_drain_enabled()
@@ -10138,6 +10164,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
+            if await self._should_suppress_internal_group_output(source):
+                logger.info(
+                    "Shared WhatsApp group: restart/drain status suppressed"
+                )
+                return None
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)

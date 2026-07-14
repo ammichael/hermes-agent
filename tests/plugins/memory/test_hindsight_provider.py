@@ -417,12 +417,44 @@ class TestConfig:
 
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "42"
 
+    def test_embedded_profile_env_preserves_local_runtime_settings(self):
+        env = _build_embedded_profile_env({
+            "llm_provider": "ollama",
+            "llm_model": "gemma3:12b",
+            "embeddings_provider": "openai",
+            "embeddings_openai_api_key": "ollama",
+            "embeddings_openai_model": "all-minilm",
+            "embeddings_openai_base_url": "http://localhost:11434/v1",
+            "embeddings_openai_dimensions": 384,
+            "reranker_provider": "rrf",
+            "enable_observations": False,
+            "enable_auto_consolidation": False,
+            "worker_max_slots": 10,
+            "worker_consolidation_max_slots": 0,
+            "worker_retain_max_slots": 10,
+            "worker_file_convert_retain_max_slots": 0,
+        })
+
+        assert env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] == "openai"
+        assert env["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] == "ollama"
+        assert env["HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"] == "all-minilm"
+        assert env["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] == "http://localhost:11434/v1"
+        assert env["HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"] == "384"
+        assert env["HINDSIGHT_API_RERANKER_PROVIDER"] == "rrf"
+        assert env["HINDSIGHT_API_ENABLE_OBSERVATIONS"] == "false"
+        assert env["HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION"] == "false"
+        assert env["HINDSIGHT_API_WORKER_MAX_SLOTS"] == "10"
+        assert env["HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS"] == "0"
+        assert env["HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS"] == "10"
+        assert env["HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS"] == "0"
+
     def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
         captured = {}
 
         class FakeHindsightEmbedded:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
+                self.config = {}
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
