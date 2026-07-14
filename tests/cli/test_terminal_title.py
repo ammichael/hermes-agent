@@ -1,5 +1,6 @@
 """Cross-terminal session-title synchronization."""
 
+import threading
 from unittest.mock import MagicMock, patch
 
 from hermes_cli.terminal_title import normalize_terminal_title, set_terminal_title
@@ -127,6 +128,73 @@ def test_cli_title_sync_targets_current_session():
             expected_session_id="current-session",
         ) is True
     setter.assert_called_once_with("App Store Estrago")
+
+
+def test_async_title_that_started_first_cannot_finish_after_resumed_title():
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "old-session"
+    cli._terminal_title_lock = threading.RLock()
+    cli._session_db = MagicMock()
+    cli._session_db.get_session_title.return_value = "Old Async Title"
+    old_entered = threading.Event()
+    release_old = threading.Event()
+    completion_order = []
+
+    def blocking_setter(title):
+        if title == "Old Async Title":
+            old_entered.set()
+            assert release_old.wait(2)
+        completion_order.append(title)
+        return True
+
+    with patch(
+        "hermes_cli.terminal_title.set_terminal_title",
+        side_effect=blocking_setter,
+    ):
+        old_worker = threading.Thread(
+            target=cli._sync_terminal_session_title,
+            args=("Old Async Title",),
+            kwargs={
+                "expected_session_id": "old-session",
+                "require_persisted_title": True,
+            },
+        )
+        old_worker.start()
+        assert old_entered.wait(2)
+
+        cli.session_id = "new-session"
+        new_worker = threading.Thread(
+            target=cli._sync_terminal_session_title,
+            args=("New Resume Title",),
+        )
+        new_worker.start()
+        release_old.set()
+        old_worker.join(2)
+        new_worker.join(2)
+
+    assert not old_worker.is_alive()
+    assert not new_worker.is_alive()
+    assert completion_order == ["Old Async Title", "New Resume Title"]
+
+
+def test_async_title_must_still_be_the_persisted_title():
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "current-session"
+    cli._terminal_title_lock = threading.RLock()
+    cli._session_db = MagicMock()
+    cli._session_db.get_session_title.return_value = "Manual Session Title"
+
+    with patch("hermes_cli.terminal_title.set_terminal_title") as setter:
+        assert cli._sync_terminal_session_title(
+            "Auto Generated Title",
+            expected_session_id="current-session",
+            require_persisted_title=True,
+        ) is False
+    setter.assert_not_called()
 
 
 def test_manual_title_updates_session_and_terminal():

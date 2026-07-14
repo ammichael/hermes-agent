@@ -1,5 +1,6 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
+import threading
 from unittest.mock import MagicMock, patch
 
 
@@ -160,6 +161,22 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("question", "answer") is None
 
+    def test_counts_words_after_canonical_session_sanitization(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "One \u200b Two"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") is None
+
+    def test_rejects_unsegmented_cjk_instead_of_persisting_one_token(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "日本語の三語タイトル"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("質問", "回答") is None
+
     def test_returns_none_on_empty_response(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -239,14 +256,18 @@ class TestAutoTitleSession:
     def test_generates_and_sets_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None
+        db.set_session_title_if_absent.return_value = True
 
-        with patch("agent.title_generator.generate_title", return_value="New Title"):
+        with patch("agent.title_generator.generate_title", return_value="New Useful Title"):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_called_once_with("sess-1", "New Title")
+            db.set_session_title_if_absent.assert_called_once_with(
+                "sess-1", "New Useful Title"
+            )
 
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None
+        db.set_session_title_if_absent.return_value = True
         seen = []
         with patch("agent.title_generator.generate_title", return_value="Readable Session"):
             auto_title_session(
@@ -256,8 +277,75 @@ class TestAutoTitleSession:
                 "hi there",
                 title_callback=seen.append,
             )
-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
+        db.set_session_title_if_absent.assert_called_once_with(
+            "sess-1", "Readable Session"
+        )
         assert seen == ["Readable Session"]
+
+    def test_skips_callback_when_conditional_title_write_loses(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_session_title_if_absent.return_value = False
+        seen = []
+
+        with patch(
+            "agent.title_generator.generate_title",
+            return_value="Auto Generated Title",
+        ):
+            auto_title_session(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                title_callback=seen.append,
+            )
+
+        assert seen == []
+
+    def test_manual_title_wins_while_generation_is_in_flight(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class FakeDB:
+            def __init__(self):
+                self.title = None
+                self.lock = threading.Lock()
+
+            def get_session_title(self, _session_id):
+                with self.lock:
+                    return self.title
+
+            def set_session_title_if_absent(self, _session_id, title):
+                with self.lock:
+                    if self.title is not None:
+                        return False
+                    self.title = title
+                    return True
+
+        db = FakeDB()
+        seen = []
+
+        def delayed_generate(*_args, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return "Auto Generated Title"
+
+        with patch("agent.title_generator.generate_title", side_effect=delayed_generate):
+            worker = threading.Thread(
+                target=auto_title_session,
+                args=(db, "sess-1", "hello", "hi there"),
+                kwargs={"title_callback": seen.append},
+            )
+            worker.start()
+            assert started.wait(2)
+            with db.lock:
+                db.title = "Manual Session Title"
+            release.set()
+            worker.join(2)
+
+        assert not worker.is_alive()
+        assert db.title == "Manual Session Title"
+        assert seen == []
 
     def test_skips_if_generation_fails(self):
         db = MagicMock()
@@ -265,7 +353,7 @@ class TestAutoTitleSession:
 
         with patch("agent.title_generator.generate_title", return_value=None):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_not_called()
+            db.set_session_title_if_absent.assert_not_called()
 
 
 class TestMaybeAutoTitle:

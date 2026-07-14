@@ -39,12 +39,20 @@ _MAX_GENERATED_WORD_CHARS = 24
 
 
 def _normalize_generated_title(title: str) -> Optional[str]:
-    """Enforce the three-word navigation contract independent of model output."""
+    """Enforce the three-word navigation contract after DB sanitization."""
     words = title.split()
     if len(words) < 3:
         return None
     bounded = [word[:_MAX_GENERATED_WORD_CHARS] for word in words[:3]]
-    return " ".join(bounded)
+    try:
+        from hermes_state import SessionDB
+
+        candidate = SessionDB.sanitize_title(" ".join(bounded))
+    except (ImportError, ValueError):
+        return None
+    if not candidate or len(candidate.split()) != 3:
+        return None
+    return candidate
 
 
 def _title_language() -> str:
@@ -162,7 +170,8 @@ def auto_title_session(
         return
 
     try:
-        session_db.set_session_title(session_id, title)
+        if not session_db.set_session_title_if_absent(session_id, title):
+            return
         logger.debug("Auto-generated session title: %s", title)
         if title_callback is not None:
             try:

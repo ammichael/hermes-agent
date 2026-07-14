@@ -3684,21 +3684,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _sync_terminal_session_title(
         self,
-        title: str,
+        title: str | None,
         *,
         expected_session_id: str | None = None,
+        require_persisted_title: bool = False,
     ) -> bool:
         """Best-effort title sync scoped to this CLI's controlling terminal.
 
         ``expected_session_id`` closes the race where asynchronous auto-title
         generation finishes after the user has already switched sessions.
+        All terminal writes are serialized so a session-switch title that
+        starts later is also guaranteed to finish later.
         """
-        if expected_session_id and expected_session_id != self.session_id:
-            return False
+        lock = getattr(self, "_terminal_title_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._terminal_title_lock = lock
         try:
             from hermes_cli.terminal_title import set_terminal_title
 
-            return set_terminal_title(title)
+            with lock:
+                if expected_session_id and expected_session_id != self.session_id:
+                    return False
+                if require_persisted_title:
+                    db = getattr(self, "_session_db", None)
+                    if not db or db.get_session_title(self.session_id) != title:
+                        return False
+                return set_terminal_title(title or "Sessão Sem Título")
         except Exception:
             return False
     
@@ -3987,6 +3999,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        self._terminal_title_lock = threading.RLock()
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
         # frozen when the agent thread completes, displayed in the status bar.
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
@@ -12600,6 +12613,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         self._sync_terminal_session_title(
                             title,
                             expected_session_id=_auto_title_session_id,
+                            require_persisted_title=True,
                         )
 
                     maybe_auto_title(

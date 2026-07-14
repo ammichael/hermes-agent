@@ -3025,6 +3025,27 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def set_session_title_if_absent(self, session_id: str, title: str) -> bool:
+        """Set a title only while the session remains untitled.
+
+        The conditional update and its decision run in one SQLite write
+        transaction, so a concurrent explicit ``/title`` always wins over a
+        background auto-title that started earlier.
+        """
+        clean_title = self.sanitize_title(title)
+        if not clean_title:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ? AND title IS NULL",
+                (clean_title, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
         with self._lock:

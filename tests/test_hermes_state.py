@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 import pytest
@@ -2989,6 +2990,45 @@ class TestSessionTitle:
 
         session = db.get_session("s1")
         assert session["title"] == "Updated Title"
+
+    def test_set_title_if_absent_writes_once(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.set_session_title_if_absent("s1", "Auto Generated Title") is True
+        assert db.set_session_title_if_absent("s1", "Second Auto Title") is False
+        assert db.get_session_title("s1") == "Auto Generated Title"
+
+    def test_set_title_if_absent_preserves_manual_title(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_title("s1", "Manual Session Title")
+
+        assert db.set_session_title_if_absent("s1", "Auto Generated Title") is False
+        assert db.get_session_title("s1") == "Manual Session Title"
+
+    def test_explicit_title_wins_real_concurrent_write(self, db):
+        db.create_session(session_id="s1", source="cli")
+        barrier = threading.Barrier(3)
+
+        def auto_title():
+            barrier.wait()
+            db.set_session_title_if_absent("s1", "Auto Generated Title")
+
+        def manual_title():
+            barrier.wait()
+            db.set_session_title("s1", "Manual Session Title")
+
+        workers = [
+            threading.Thread(target=auto_title),
+            threading.Thread(target=manual_title),
+        ]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(2)
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert db.get_session_title("s1") == "Manual Session Title"
 
     def test_title_in_search_sessions(self, db):
         db.create_session(session_id="s1", source="cli")
