@@ -147,6 +147,23 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+def openai_codex_large_ttfb_floor(est_tokens: int) -> float:
+    """Bound first-byte silence for large Codex requests without being twitchy.
+
+    Large prompts legitimately need longer prefill than the small-request TTFB
+    cutoff, but disabling the watchdog entirely lets a zero-event socket hold a
+    user-facing gateway turn until the 10–20 minute wall-clock stale timeout.
+    Keep a generous context-scaled floor while retaining a finite reconnect.
+    """
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 150.0
+    if est_tokens > 10_000:
+        return 120.0
+    return 0.0
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -488,8 +505,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # stream event has arrived yet we apply a much shorter TTFB cutoff so the
     # main retry loop can reconnect promptly. Large subscription-backed Codex
     # requests can legitimately spend tens of seconds in backend admission /
-    # prompt prefill before the first SSE event, so the no-byte TTFB watchdog
-    # is disabled for large chatgpt.com/backend-api/codex requests. A second
+    # prompt prefill before the first SSE event, so large requests use a
+    # generous context-scaled TTFB floor instead of the small-request cutoff.
+    # The timeout remains finite because a zero-event socket is otherwise able
+    # to hold a user-facing gateway turn for 10–20 minutes. A second
     # failure mode emits an opening SSE frame and then stalls forever in SSL
     # read; for that we watch the gap since the last Codex stream event. This
     # matches Codex CLI's stream_idle_timeout model: any valid SSE event is
@@ -533,25 +552,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _ttfb_disable_above > 0
             and _est_tokens_for_codex_watchdog >= _ttfb_disable_above
         ):
-            _ttfb_enabled = False
+            _large_ttfb_floor = openai_codex_large_ttfb_floor(
+                _est_tokens_for_codex_watchdog
+            )
+            _ttfb_timeout = max(_ttfb_timeout, _large_ttfb_floor)
             logger.info(
-                "Disabling openai-codex no-byte TTFB watchdog for large request "
-                "(context=~%s tokens >= %.0f). Waiting for backend response instead. "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
+                "Using bounded openai-codex no-byte TTFB watchdog for large request "
+                "(context=~%s tokens >= %.0f, timeout=%.0fs). "
+                "Set HERMES_CODEX_TTFB_STRICT=1 to force the configured cutoff.",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_disable_above,
+                _ttfb_timeout,
             )
         else:
-            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
-            if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
-                logger.info(
-                    "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
-                    "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
-                    _ttfb_timeout,
-                    _ttfb_cap,
-                    f"{_est_tokens_for_codex_watchdog:,}",
-                )
-                _ttfb_timeout = _ttfb_cap
+            pass
+        _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 180.0)
+        if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
+            logger.info(
+                "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                _ttfb_timeout,
+                _ttfb_cap,
+                f"{_est_tokens_for_codex_watchdog:,}",
+            )
+            _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
     _codex_idle_timeout = _env_float(
