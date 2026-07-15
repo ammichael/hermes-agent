@@ -15968,6 +15968,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _configure_single_query_quiet_mode(cli) -> None:
+    """Keep ``chat -Q`` stdout limited to the final response.
+
+    Tool progress and inline diff callbacks are independent display paths.
+    Disabling only tool progress still lets write/patch diffs escape to stdout,
+    which breaks subprocess integrations that treat quiet stdout as the answer.
+    """
+    cli.tool_progress_mode = "off"
+    cli._inline_diffs_enabled = False
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -16300,7 +16311,7 @@ def main(
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
-                cli.tool_progress_mode = "off"
+                _configure_single_query_quiet_mode(cli)
                 if cli._ensure_runtime_credentials():
                     effective_query: Any = query
                     if single_query_images or single_query_image_urls:
