@@ -101,7 +101,9 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 #         outbound channel and run the watcher/drain loops.
 # False — stateless request/response adapters (the API server: every route,
 #         spec and proprietary, tears down its channel when the turn ends, so
-#         a background completion that finishes later has nowhere to go).
+#         a background completion that finishes later has nowhere to go), and
+#         cron turns (the scheduler owns one bounded response and has no live
+#         per-turn channel for a detached completion to re-enter).
 #
 # Tools that promise async delivery (terminal notify_on_complete /
 # watch_patterns, delegate_task background=True) read this via
@@ -111,7 +113,8 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # Default _UNSET => treated as supported, so CLI (which never sets a platform)
 # and any contextvar-unaware path keep working. Stateless adapters opt OUT by
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
-# propagates that into this contextvar at session-bind time.
+# propagates that into this contextvar at session-bind time. Cron opts out in
+# ``cron.scheduler.run_job``.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs

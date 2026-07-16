@@ -2851,7 +2851,9 @@ def run_job(
     os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
+    # don't clobber each other's targets (os.environ is process-global). Cron
+    # has one bounded scheduler-owned response and no live channel for detached
+    # delegate/process completions to re-enter after this turn ends.
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
@@ -2877,8 +2879,10 @@ def run_job(
     # below, so clearing HERMES_SESSION_* here does not affect delivery.
     _ctx_tokens = set_session_vars(
         platform="",
+        source="cron",
         chat_id="",
         chat_name="",
+        async_delivery=False,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
