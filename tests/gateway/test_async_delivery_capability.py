@@ -35,7 +35,7 @@ from gateway.session_context import (
 
 class TestAsyncDeliverySupported:
     def test_default_unbound_is_supported(self):
-        """CLI / cron / unaware paths never bind the var -> supported."""
+        """CLI / unaware paths never bind the var -> supported."""
         assert async_delivery_supported() is True
 
     def test_set_true_is_supported(self):

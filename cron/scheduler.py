@@ -2998,7 +2998,20 @@ def _cron_execution_scope(job: dict, job_id: str):
     # can fail, and cleanup must still restore the cron approval boundary.
     try:
         cron_identity_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
-        ctx_tokens = set_session_vars(platform="", chat_id="", chat_name="")
+        # A cron turn has no live conversational return channel of its own.
+        # Its final response is delivered by the scheduler only after
+        # run_conversation returns.  Promising detached notifications here
+        # (delegate_task(background=true), terminal notify_on_complete, etc.)
+        # leaves the completion queue with an unroutable ``cron_*`` session key
+        # and can silently strand the result.  Mark the capability unsupported
+        # so tools fall back to synchronous work or explicit polling instead.
+        ctx_tokens = set_session_vars(
+            platform="",
+            source="cron",
+            chat_id="",
+            chat_name="",
+            async_delivery=False,
+        )
         for var_name in cron_delivery_vars:
             cron_delivery_tokens[var_name] = _VAR_MAP[var_name].set("")
 
