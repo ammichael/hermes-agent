@@ -5558,7 +5558,10 @@ def run_conversation(
                                 "role": "tool",
                                 "name": _ra().AIAgent._get_tool_call_name_static(tc),
                                 "tool_call_id": tc["id"],
-                                "content": f"Error executing tool: {error_msg}",
+                                "content": (
+                                    "Error executing tool: an internal processing "
+                                    "error occurred; diagnostic details were kept local."
+                                ),
                             }
                             messages.append(err_msg)
                 break
@@ -5571,8 +5574,10 @@ def run_conversation(
 
             # If we're near the limit, break to avoid infinite loops
             if api_call_count >= agent.max_iterations - 1:
-                _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-                final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                _turn_exit_reason = "error_near_max_iterations"
+                final_response = agent._format_turn_completion_explanation(
+                    _turn_exit_reason
+                ) or "⚠️ The turn stopped after an internal processing error."
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})

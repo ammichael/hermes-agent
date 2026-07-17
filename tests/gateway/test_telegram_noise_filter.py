@@ -69,6 +69,21 @@ def test_programmatic_surfaces_keep_raw_status():
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_sanitize_legacy_repeated_error_envelope(platform):
+    raw = (
+        "I apologize, but I encountered repeated errors: "
+        "Error during OpenAI-compatible API call #89: Traceback /private/path"
+    )
+
+    sanitized = _sanitize_gateway_final_response(platform, raw)
+
+    assert "Traceback" not in sanitized
+    assert "/private/path" not in sanitized
+    assert "repeated errors" not in sanitized.lower()
+    assert _sanitize_gateway_final_response("local", raw) == raw
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", NOISY_STATUS_MESSAGES)
 def test_all_chat_gateways_suppress_noise(platform, message):
     """Operational lifecycle/retry noise must be suppressed on every chat surface."""

@@ -144,17 +144,31 @@ def test_persist_user_message_override_preserves_multimodal_turns(agent):
     assert messages == [{"role": "user", "content": multimodal_content}]
 
 
-def test_interim_assistant_visible_text_ignores_multimodal_user_content(agent):
-    """A user image turn before a tool call is not assistant interim text."""
-    user_msg = {
-        "role": "user",
+@pytest.mark.parametrize("role", ["user", "tool"])
+def test_interim_assistant_visible_text_ignores_nonassistant_multimodal_content(
+    agent, role
+):
+    """A multimodal user/tool turn is never assistant interim text."""
+    previous_msg = {
+        "role": role,
         "content": [
             {"type": "text", "text": "Describe this screenshot"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ],
     }
 
-    assert agent._interim_assistant_visible_text(user_msg) == ""
+    assert agent._interim_assistant_visible_text(previous_msg) == ""
+
+
+def test_error_completion_explanation_does_not_echo_internal_diagnostics(agent):
+    diagnostic = "error_near_max_iterations(Traceback /private/path token=secret)"
+
+    text = agent._format_turn_completion_explanation(diagnostic)
+
+    assert text
+    assert "Traceback" not in text
+    assert "/private/path" not in text
+    assert "token=secret" not in text
 
 
 def test_persist_user_message_override_restores_clean_multimodal_note(agent):

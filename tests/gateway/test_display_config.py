@@ -94,6 +94,24 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_memory_notifications_support_platform_override(self):
+        from gateway.display_config import OVERRIDEABLE_KEYS, resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": False}},
+            }
+        }
+
+        assert "memory_notifications" in OVERRIDEABLE_KEYS
+        assert resolve_display_setting(
+            config, "whatsapp", "memory_notifications", "on"
+        ) is False
+        assert resolve_display_setting(
+            config, "telegram", "memory_notifications", "on"
+        ) == "on"
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides

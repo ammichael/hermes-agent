@@ -411,6 +411,7 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"|http\s*\d{3}\b"
     r"|incorrect\s+api\s+key"
     r"|invalid\s+api\s+key"
+    r"|i\s+apologize,?\s+but\s+i\s+encountered\s+repeated\s+errors"
     r")",
     re.IGNORECASE,
 )
