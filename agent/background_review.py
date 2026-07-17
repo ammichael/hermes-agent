@@ -479,14 +479,10 @@ def summarize_background_review_actions(
 
         message_lower = message.lower()
         if not verbose:
-            if "created" in message_lower:
-                actions.append(message)
-                continue
-            if "updated" in message_lower:
-                actions.append(message)
-                continue
-            if is_skill and "patched" in message_lower:
-                actions.append(message)
+            if is_skill and any(
+                marker in message_lower for marker in ("created", "updated", "patched")
+            ):
+                actions.append("Skill updated")
                 continue
 
         if is_skill:

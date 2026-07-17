@@ -473,3 +473,13 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_skill_patch_on_is_generic_and_disclosure_free():
+    actions = summarize_background_review_actions(
+        _skill_patch_review(), [], notification_mode="on"
+    )
+
+    assert actions == ["Skill updated"]
+    assert "demo" not in actions[0]
+    assert "SKILL.md" not in actions[0]

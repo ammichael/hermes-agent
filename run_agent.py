@@ -4817,10 +4817,14 @@ class AIAgent:
         while tools are still pending; treating top-level content as progress
         in that shape leaks the answer before the tool call runs.
         """
+        if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
+            return ""
         visible = self._extract_codex_interim_visible_text(assistant_msg)
         if visible:
             return visible
         content = assistant_msg.get("content")
+        if not isinstance(content, str):
+            return ""
         return self._strip_think_blocks(content or "").strip()
 
     def _interim_text_was_delivered(self, text: str) -> bool:

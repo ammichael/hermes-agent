@@ -2012,6 +2012,44 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     return None
 
 
+def _resolve_cron_failure_deliver(cfg: Optional[dict] = None) -> str:
+    """Resolve cron failures fail-closed to local operator evidence.
+
+    The active health monitor owns persistence, repair, and escalation.  A
+    failed job must therefore never inherit its normal ``deliver`` audience.
+    Unknown or external values stay local until the dedicated operational
+    route is installed with the full audience-collision contract.
+    """
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        raw = (cfg.get("cron", {}) or {}).get("failure_deliver", "local")
+        target = _normalize_deliver_value(raw).strip().lower()
+    except Exception:
+        return "local"
+    if target != "local":
+        logger.warning("Unsupported cron failure destination; keeping failure local")
+    return "local"
+
+
+def _deliver_cron_failure(
+    job: dict,
+    content: str,
+    *,
+    adapters=None,
+    loop=None,
+    cfg: Optional[dict] = None,
+) -> Optional[str]:
+    """Persist-only failure boundary; never reuse the job's normal audience."""
+    del content, adapters, loop
+    _resolve_cron_failure_deliver(cfg)
+    logger.info(
+        "Job '%s': failure kept local for the Cron Health Monitor",
+        job.get("id", "?"),
+    )
+    return None
+
+
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
@@ -3720,9 +3758,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     "(tool subprocess was killed mid-flight)."
                 )
 
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
+            # Successful output goes to the job's normal audience. Failed runs
+            # never inherit that audience; raw evidence is already saved above
+            # and the Cron Health Monitor owns repair/escalation.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
@@ -3740,7 +3778,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if success:
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop,
+                        )
+                    else:
+                        delivery_error = _deliver_cron_failure(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

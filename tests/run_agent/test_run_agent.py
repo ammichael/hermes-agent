@@ -144,6 +144,19 @@ def test_persist_user_message_override_preserves_multimodal_turns(agent):
     assert messages == [{"role": "user", "content": multimodal_content}]
 
 
+def test_interim_assistant_visible_text_ignores_multimodal_user_content(agent):
+    """A user image turn before a tool call is not assistant interim text."""
+    user_msg = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+    }
+
+    assert agent._interim_assistant_visible_text(user_msg) == ""
+
+
 def test_persist_user_message_override_restores_clean_multimodal_note(agent):
     clean_content = [
         {"type": "text", "text": "Describe this screenshot"},

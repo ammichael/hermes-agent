@@ -4872,7 +4872,10 @@ def run_conversation(
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
                 previous_interim_visible = (
                     agent._interim_assistant_visible_text(previous_msg)
-                    if isinstance(previous_msg, dict)
+                    if (
+                        isinstance(previous_msg, dict)
+                        and previous_msg.get("role") == "assistant"
+                    )
                     else ""
                 )
                 duplicate_previous_interim = (

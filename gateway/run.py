@@ -19229,11 +19229,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pdc = getattr(_status_adapter, "_post_delivery_callbacks", None)
                     if _pdc is not None:
                         _pdc[session_key] = _release_bg_review_messages
-            # Memory update notifications in chat.  Config: display.memory_notifications
+            # Memory update notifications in chat. Config supports a global
+            # default plus per-platform overrides under display.platforms.
             #   off     — no chat notification (still logged to stdout)
             #   on      — generic "💾 Memory updated" (default)
             #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
-            _mem_notif = user_config.get("display", {}).get("memory_notifications")
+            from gateway.display_config import (
+                resolve_display_setting as _resolve_display_setting_for_memory,
+            )
+
+            _mem_notif = _resolve_display_setting_for_memory(
+                user_config,
+                _platform_config_key(source.platform),
+                "memory_notifications",
+                "on",
+            )
             if isinstance(_mem_notif, bool):
                 _mem_notif = "on" if _mem_notif else "off"
             agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"

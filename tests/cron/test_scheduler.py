@@ -14,6 +14,35 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+def test_cron_failure_delivery_resolver_is_local_only():
+    from cron.scheduler import _resolve_cron_failure_deliver
+
+    assert _resolve_cron_failure_deliver({"cron": {"failure_deliver": "local"}}) == "local"
+    assert _resolve_cron_failure_deliver({"cron": {"failure_deliver": "origin"}}) == "local"
+    assert _resolve_cron_failure_deliver(
+        {"cron": {"failure_deliver": "whatsapp:some-ops-room"}}
+    ) == "local"
+
+
+def test_cron_failure_delivery_never_calls_normal_delivery():
+    from cron.scheduler import _deliver_cron_failure
+
+    job = {
+        "id": "private-job-id",
+        "deliver": "origin",
+        "origin": {"platform": "whatsapp", "chat_id": "private-chat"},
+    }
+    with patch("cron.scheduler._deliver_result") as normal_delivery:
+        result = _deliver_cron_failure(
+            job,
+            "Traceback: /private/path token-like-value",
+            cfg={"cron": {"failure_deliver": "local"}},
+        )
+
+    assert result is None
+    normal_delivery.assert_not_called()
+
+
 class TestPerJobToolsetMcpMerge:
     """A per-job enabled_toolsets allowlist must not silently drop MCP servers."""
 
@@ -2661,16 +2690,18 @@ class TestSilentDelivery:
         assert not sil("")
         assert not sil("   \n\t ")
 
-    def test_failed_job_always_delivers(self):
-        """Failed jobs deliver regardless of [SILENT] in output."""
+    def test_failed_job_never_uses_normal_delivery_audience(self):
+        """Failed jobs stay local and bypass the job's normal audience."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler._deliver_result") as normal_delivery, \
+             patch("cron.scheduler._deliver_cron_failure") as failure_delivery, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_called_once()
+        normal_delivery.assert_not_called()
+        failure_delivery.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
