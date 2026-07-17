@@ -15992,6 +15992,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         durable_delegation_id, exc,
                     )
                     return False
+
+        # Cron owns one bounded scheduler response and has no live channel for
+        # a detached result to re-enter.  New cron turns are prevented from
+        # creating these events by the async-delivery capability gate, but
+        # durable rows created before that contract can be restored after every
+        # gateway restart.  Terminally acknowledge only this structurally
+        # unroutable legacy class; otherwise each restart releases the claim,
+        # replays the same row, and emits another source-unresolvable warning.
+        # Do not generalize this to CLI/TUI events: another consumer may still
+        # positively own those session keys.
+        session_key = str(evt.get("session_key") or "").strip()
+        if evt.get("type") == "async_delegation" and session_key.startswith("cron_"):
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import complete_completion_delivery
+
+                    complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not retire legacy cron async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+                    try:
+                        from tools.async_delegation import release_completion_delivery
+
+                        release_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not release legacy cron completion claim",
+                            exc_info=True,
+                        )
+                    return False
+            logger.info(
+                "Retired legacy detached cron completion without gateway injection"
+            )
+            return None
         if identity is not None:
             with self._completion_delivery_lock:
                 if (

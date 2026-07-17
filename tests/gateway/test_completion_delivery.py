@@ -131,6 +131,41 @@ def test_unroutable_async_event_is_not_requeued_forever(
     assert isolated.empty()
 
 
+def test_legacy_cron_async_event_is_terminally_retired(
+    monkeypatch, isolated_registry, caplog,
+):
+    """Pre-capability cron rows must not warn and replay after every restart."""
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_legacy_cron")
+    event["session_key"] = "cron_deadbeefcafe_20260716_165732"
+    record = {
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "parent_session_id": event["session_key"],
+        "dispatched_at": event["dispatched_at"],
+        "goal": event["goal"],
+    }
+    async_delegation._persist_dispatch(record)
+    async_delegation._persist_completion(event, {"status": "completed"})
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_not_awaited()
+    assert isolated.empty()
+    durable = async_delegation.get_durable_delegation("deleg_legacy_cron")
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
+    assert "Synthetic event source unresolvable" not in caplog.text
+
+
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     """Concurrent consumers in one runner cannot both enter the adapter."""
     entered = asyncio.Event()
