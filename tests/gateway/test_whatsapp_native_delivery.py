@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from tests.gateway.test_whatsapp_formatting import _AsyncCM, _make_adapter
 
@@ -43,6 +44,51 @@ async def test_send_poll_posts_to_bridge_poll_endpoint():
         "options": ["Approve", "Deny"],
         "selectableCount": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_uses_single_select_poll_by_default():
+    adapter = _make_adapter()
+    adapter.send_poll = AsyncMock(return_value=SendResult(success=True, message_id="poll-single"))
+
+    result = await adapter.send_clarify(
+        "15551234567",
+        "Pick one",
+        ["A", "B", "C"],
+        "clarify-1",
+        "session-1",
+    )
+
+    assert result.success
+    adapter.send_poll.assert_awaited_once_with(
+        "15551234567",
+        "Pick one",
+        ["A", "B", "C"],
+        selectable_count=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_uses_multi_select_poll_when_requested():
+    adapter = _make_adapter()
+    adapter.send_poll = AsyncMock(return_value=SendResult(success=True, message_id="poll-multi"))
+
+    result = await adapter.send_clarify(
+        "15551234567",
+        "Pick any",
+        ["A", "B", "C"],
+        "clarify-2",
+        "session-2",
+        metadata={"clarify_multiple": True},
+    )
+
+    assert result.success
+    adapter.send_poll.assert_awaited_once_with(
+        "15551234567",
+        "Pick any",
+        ["A", "B", "C", "✅ Concluir seleção"],
+        selectable_count=4,
+    )
 
 
 @pytest.mark.asyncio

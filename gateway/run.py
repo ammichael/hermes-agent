@@ -4981,7 +4981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
-        Priority: session-scoped ``/reasoning --session`` override >
+        Priority: session-scoped ``/reasoning`` override > channel override >
         per-model override (``agent.reasoning_overrides``) > global
         ``agent.reasoning_effort``. ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
@@ -4998,6 +4998,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+
+        if source is not None:
+            config = getattr(self, "config", None)
+            if config is not None:
+                override = _get_channel_override(
+                    config,
+                    source.platform,
+                    source.chat_id,
+                    thread_id=source.thread_id,
+                    parent_id=source.parent_chat_id,
+                )
+                if override is not None and override.reasoning_effort is not None:
+                    from hermes_constants import parse_reasoning_effort
+
+                    parsed = parse_reasoning_effort(override.reasoning_effort)
+                    if parsed is not None:
+                        return parsed
+                    logger.warning(
+                        "Unknown channel reasoning_effort '%s' for %s:%s; "
+                        "falling back to model/global config",
+                        override.reasoning_effort,
+                        source.platform.value,
+                        source.chat_id,
+                    )
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -19260,7 +19284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # explaining that no response arrived (so the agent can adapt
             # rather than hang forever).
             # ------------------------------------------------------------------
-            def _clarify_callback_sync(question: str, choices) -> str:
+            def _clarify_callback_sync(question: str, choices, *, multiple: bool = False) -> str:
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
@@ -19273,6 +19297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key or "",
                     question=question,
                     choices=list(choices) if choices else None,
+                    multiple=multiple,
                 )
 
                 # Pause typing — like approval, we don't want a "thinking..."
@@ -19284,6 +19309,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+                clarify_metadata = dict(_status_thread_metadata or {})
+                if multiple:
+                    clarify_metadata["clarify_multiple"] = True
+
                 send_ok = False
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
@@ -19292,7 +19321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         choices=list(choices) if choices else None,
                         clarify_id=clarify_id,
                         session_key=session_key or "",
-                        metadata=_status_thread_metadata,
+                        metadata=clarify_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,

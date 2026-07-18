@@ -43,6 +43,8 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  pollUpdateIdentity,
+  pollSelectionForClarify,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -313,16 +315,10 @@ function logPollUpdateDiagnostic({ sourcePath, pollId, pollCreation, pollUpdates
 }
 
 function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
-  const chatId = normalizeWhatsAppId(key?.remoteJid || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.remoteJid || '');
-  const senderId = normalizeWhatsAppId(
-    key?.participant
-    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.participant
-    || chatId
-  );
-  const pollId = key?.id
-    || update?.pollUpdates?.[0]?.pollCreationMessageKey?.id
-    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.id
-    || '';
+  const identity = pollUpdateIdentity({ key, pollUpdate: update?.pollUpdates?.[0] });
+  const chatId = normalizeWhatsAppId(identity.chatId);
+  const senderId = normalizeWhatsAppId(identity.senderId || chatId);
+  const pollId = identity.pollId;
   // Only surface votes on polls Hermes itself created (tracked when
   // /send-poll returns). Arbitrary human polls in a group chat must not
   // inject agent-visible messages on every vote.
@@ -332,6 +328,9 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     }
     return;
   }
+  const selection = pollSelectionForClarify({ selectedOptions, aggregation });
+  if (!selection.ready) return;
+  selectedOptions = selection.selectedOptions;
   const chosenText = selectedOptions.length ? selectedOptions.join(', ') : `[Poll update${pollId ? `: ${pollId}` : ''}]`;
   const dedupeId = `poll:${pollId}:${senderId}:${selectedOptions.join('|')}`;
   if (recentlyProcessedPollUpdates.has(dedupeId)) return;

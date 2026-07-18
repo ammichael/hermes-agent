@@ -71,6 +71,37 @@ export function pollCreationMessageSecret(pollCreation) {
     || null;
 }
 
+export const CLARIFY_POLL_DONE_OPTION = '✅ Concluir seleção';
+
+export function pollUpdateIdentity({ key = {}, pollUpdate = {} } = {}) {
+  const creationKey = pollUpdate?.pollCreationMessageKey || {};
+  const voteKey = pollUpdate?.pollUpdateMessageKey || {};
+  return {
+    // `messages.update` may expose the vote message as `key`; only the
+    // creation key identifies the Hermes-created poll tracked by /send-poll.
+    pollId: creationKey.id || key.id || voteKey.id || '',
+    chatId: creationKey.remoteJid || key.remoteJid || voteKey.remoteJid || '',
+    // Attribute the synthetic inbound event to the voter, not the poll author.
+    senderId: voteKey.participant || key.participant || voteKey.remoteJid || key.remoteJid || '',
+  };
+}
+
+export function pollSelectionForClarify({ selectedOptions = [], aggregation = [] } = {}) {
+  const pollHasDoneOption = (aggregation || []).some(
+    option => String(option?.name || '') === CLARIFY_POLL_DONE_OPTION,
+  );
+  if (!pollHasDoneOption) {
+    return { ready: true, selectedOptions: [...selectedOptions] };
+  }
+
+  const selected = (selectedOptions || []).map(option => String(option));
+  if (!selected.includes(CLARIFY_POLL_DONE_OPTION)) {
+    return { ready: false, selectedOptions: [] };
+  }
+  const completed = selected.filter(option => option !== CLARIFY_POLL_DONE_OPTION);
+  return { ready: completed.length > 0, selectedOptions: completed };
+}
+
 function uniqueStrings(values) {
   const seen = new Set();
   const out = [];

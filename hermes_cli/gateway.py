@@ -4791,7 +4791,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    from gateway.run import _exit_after_graceful_shutdown, start_gateway
 
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
@@ -4875,7 +4875,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
             code=getattr(e, "code", None),
             traceback=_traceback.format_exc(),
         )
-        raise
+        exit_code = (
+            0
+            if e.code is None
+            else e.code
+            if isinstance(e.code, int)
+            else 1
+        )
+        _exit_after_graceful_shutdown(exit_code)
+        return
     except BaseException as e:
         # Absolutely everything else: Exception, asyncio.CancelledError,
         # even exotic BaseException subclasses. We want the cause logged.

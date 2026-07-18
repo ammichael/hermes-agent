@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
+_CLARIFY_POLL_DONE_OPTION = "✅ Concluir seleção"
 
 
 def _listener_pids_on_port(port: int) -> list:
@@ -1044,12 +1045,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         text fallback so the user's next typed message is captured.
         """
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
-        if 2 <= len(clean_choices) <= 12:
+        allow_multiple = bool((metadata or {}).get("clarify_multiple"))
+        max_native_choices = 11 if allow_multiple else 12
+        if 2 <= len(clean_choices) <= max_native_choices:
+            poll_choices = (
+                [*clean_choices, _CLARIFY_POLL_DONE_OPTION]
+                if allow_multiple
+                else clean_choices
+            )
             result = await self.send_poll(
                 chat_id,
                 str(question or "").strip(),
-                clean_choices,
-                selectable_count=1,
+                poll_choices,
+                selectable_count=len(poll_choices) if allow_multiple else 1,
             )
             if result.success:
                 return result

@@ -51,6 +51,7 @@ class _ClarifyEntry:
     session_key: str
     question: str
     choices: Optional[List[str]]
+    multiple: bool = False
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
@@ -61,6 +62,7 @@ class _ClarifyEntry:
             "session_key": self.session_key,
             "question": self.question,
             "choices": list(self.choices) if self.choices else None,
+            "multiple": self.multiple,
         }
 
 
@@ -80,6 +82,7 @@ def register(
     session_key: str,
     question: str,
     choices: Optional[List[str]],
+    multiple: bool = False,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -91,6 +94,7 @@ def register(
         session_key=session_key,
         question=question,
         choices=list(choices) if choices else None,
+        multiple=bool(multiple),
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
     )
@@ -191,6 +195,22 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> str:
     """Map typed choice replies to canonical choice text, otherwise keep custom text."""
     text = str(response).strip()
     if entry.choices:
+        if entry.multiple and "," in text:
+            tokens = [part.strip() for part in text.split(",") if part.strip()]
+            indexes = []
+            try:
+                indexes = [int(token) - 1 for token in tokens]
+            except ValueError:
+                indexes = []
+            if indexes and all(0 <= idx < len(entry.choices) for idx in indexes):
+                seen = set()
+                selected = []
+                for idx in indexes:
+                    if idx in seen:
+                        continue
+                    seen.add(idx)
+                    selected.append(str(entry.choices[idx]).strip())
+                return ", ".join(selected)
         try:
             idx = int(text) - 1
         except ValueError:

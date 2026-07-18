@@ -81,6 +81,14 @@ class TestClarifyPrimitive:
         assert cm.resolve_text_response_for_session("sk3c", "2") is True
         assert cm.wait_for_response("id3c", timeout=0.1) == "Y"
 
+    def test_resolve_text_response_maps_multiple_numeric_choices(self):
+        """Multi-select text fallback maps comma-separated indexes canonically."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id3cm", "sk3cm", "Pick any", ["X", "Y", "Z"], multiple=True)
+        assert cm.resolve_text_response_for_session("sk3cm", "1, 3") is True
+        assert cm.wait_for_response("id3cm", timeout=0.1) == "X, Z"
+
     def test_resolve_text_response_accepts_custom_other_text(self):
         """Arbitrary typed text should resolve as a custom Other answer."""
         from tools import clarify_gateway as cm

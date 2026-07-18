@@ -56,6 +56,7 @@ def _flatten_choice(c) -> str:
 def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
+    multiple: bool = False,
     callback: Optional[Callable] = None,
 ) -> str:
     """
@@ -65,6 +66,8 @@ def clarify_tool(
         question: The question text to present.
         choices:  Up to 4 predefined answer choices. When omitted the
                   question is purely open-ended.
+        multiple: Allow selecting more than one predefined choice on supported
+                  messaging platforms. Ignored for open-ended questions.
         callback: Platform-provided function that handles the actual UI
                   interaction. Signature: callback(question, choices) -> str.
                   Injected by the agent runner (cli.py / gateway).
@@ -76,6 +79,9 @@ def clarify_tool(
         return tool_error("Question text is required.")
 
     question = question.strip()
+
+    if not isinstance(multiple, bool):
+        return tool_error("multiple must be a boolean.")
 
     # Validate and trim choices
     if choices is not None:
@@ -91,6 +97,7 @@ def clarify_tool(
             choices = choices[:MAX_CHOICES]
         if not choices:
             choices = None  # empty list → open-ended
+            multiple = False
 
     if callback is None:
         return json.dumps(
@@ -99,7 +106,10 @@ def clarify_tool(
         )
 
     try:
-        user_response = callback(question, choices)
+        if multiple:
+            user_response = callback(question, choices, multiple=True)
+        else:
+            user_response = callback(question, choices)
     except Exception as exc:
         return json.dumps(
             {"error": f"Failed to get user input: {exc}"},
@@ -109,6 +119,7 @@ def clarify_tool(
     return json.dumps({
         "question": question,
         "choices_offered": choices,
+        "multiple": multiple,
         "user_response": str(user_response).strip(),
     }, ensure_ascii=False)
 
@@ -127,8 +138,9 @@ CLARIFY_SCHEMA = {
     "description": (
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports two modes:\n\n"
-        "1. **Multiple choice** — provide up to 4 choices. The user picks one "
-        "or types their own answer via a 5th 'Other' option.\n"
+        "1. **Multiple choice** — provide up to 4 choices. By default the user "
+        "picks one; set `multiple=true` when more than one may be selected. "
+        "The user may also type their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
         "CRITICAL: when you are offering options, put each option ONLY in the "
@@ -169,6 +181,14 @@ CLARIFY_SCHEMA = {
                     "entirely ONLY for a genuinely open-ended free-text question."
                 ),
             },
+            "multiple": {
+                "type": "boolean",
+                "description": (
+                    "Set true only when the user may select several predefined "
+                    "choices. Defaults to false (single selection). Supported "
+                    "messaging platforms render a multi-select poll."
+                ),
+            },
         },
         "required": ["question"],
     },
@@ -185,6 +205,7 @@ registry.register(
     handler=lambda args, **kw: clarify_tool(
         question=args.get("question", ""),
         choices=args.get("choices"),
+        multiple=args.get("multiple", False),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",

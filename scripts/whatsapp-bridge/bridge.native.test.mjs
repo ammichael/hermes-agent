@@ -21,6 +21,8 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  pollUpdateIdentity,
+  pollSelectionForClarify,
 } from './bridge_helpers.js';
 
 // -- quoted outbound text -------------------------------------------------
@@ -249,6 +251,100 @@ import {
     },
   });
   console.log('  ✓ poll payload primitive carries a cacheable vote secret');
+}
+
+{
+  const payload = buildPollPayload({
+    question: 'Pick any that apply',
+    options: ['A', 'B', 'C'],
+    selectableCount: 3,
+  });
+
+  assert.equal(payload.poll.selectableCount, 3);
+  assert.equal(
+    pollCreationMessageFromPayload(payload).pollCreationMessage.selectableOptionsCount,
+    3,
+  );
+  console.log('  ✓ multi-select poll payload preserves selectable count');
+}
+
+{
+  const identity = pollUpdateIdentity({
+    key: {
+      id: 'vote-message-id',
+      remoteJid: 'group@g.us',
+      participant: 'poll-creator@lid',
+    },
+    pollUpdate: {
+      pollCreationMessageKey: {
+        id: 'hermes-poll-id',
+        remoteJid: 'group@g.us',
+        fromMe: true,
+      },
+      pollUpdateMessageKey: {
+        id: 'vote-message-id',
+        remoteJid: 'group@g.us',
+        participant: 'voter@lid',
+      },
+    },
+  });
+
+  assert.deepEqual(identity, {
+    pollId: 'hermes-poll-id',
+    chatId: 'group@g.us',
+    senderId: 'voter@lid',
+  });
+  console.log('  ✓ poll vote identity prefers creation id and voter participant');
+}
+
+{
+  const identity = pollUpdateIdentity({
+    key: {
+      id: 'vote-message-id',
+      remoteJid: 'group@g.us',
+      participant: 'voter-from-update-key@lid',
+    },
+    pollUpdate: {
+      pollCreationMessageKey: {
+        id: 'hermes-poll-id',
+        remoteJid: 'group@g.us',
+      },
+      pollUpdateMessageKey: {
+        id: 'vote-message-id',
+        remoteJid: 'group@g.us',
+      },
+    },
+  });
+
+  assert.equal(identity.senderId, 'voter-from-update-key@lid');
+  console.log('  ✓ poll vote identity never substitutes the group for a known voter');
+}
+
+{
+  const aggregation = [
+    { name: 'A', voters: ['voter@lid'] },
+    { name: 'B', voters: [] },
+    { name: '✅ Concluir seleção', voters: [] },
+  ];
+  assert.deepEqual(
+    pollSelectionForClarify({ selectedOptions: ['A'], aggregation }),
+    { ready: false, selectedOptions: [] },
+  );
+
+  aggregation[2].voters = ['voter@lid'];
+  assert.deepEqual(
+    pollSelectionForClarify({
+      selectedOptions: ['A', '✅ Concluir seleção'],
+      aggregation,
+    }),
+    { ready: true, selectedOptions: ['A'] },
+  );
+
+  assert.deepEqual(
+    pollSelectionForClarify({ selectedOptions: ['A'], aggregation: [{ name: 'A', voters: ['voter@lid'] }] }),
+    { ready: true, selectedOptions: ['A'] },
+  );
+  console.log('  ✓ multi-select clarify waits for explicit completion and strips control option');
 }
 
 {

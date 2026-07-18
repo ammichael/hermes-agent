@@ -11656,7 +11656,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices):
+    def _clarify_callback(self, question, choices, *, multiple=False):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
@@ -11666,6 +11666,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         question is dismissed and the agent is told to decide on its own.
         """
         import time as _time
+
+        if multiple and choices:
+            rendered = "\n".join(f"  {i}. {choice}" for i, choice in enumerate(choices, start=1))
+            question = (
+                f"{question}\n{rendered}\n"
+                "Enter one or more numbers separated by commas."
+            )
+            choices = None
 
         timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
         response_queue = queue.Queue()

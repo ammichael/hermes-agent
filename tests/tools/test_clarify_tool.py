@@ -44,6 +44,33 @@ class TestClarifyToolBasics:
         assert result["choices_offered"] == ["1", "2", "3"]
         assert result["user_response"] == "2"
 
+    def test_multiple_selection_is_forwarded_to_capable_callback(self):
+        """Multiple-selection intent must reach rich messaging adapters."""
+        received = {}
+
+        def mock_callback(question, choices, *, multiple=False):
+            received.update(question=question, choices=choices, multiple=multiple)
+            return "A, C"
+
+        result = json.loads(clarify_tool(
+            "Pick any",
+            choices=["A", "B", "C"],
+            multiple=True,
+            callback=mock_callback,
+        ))
+
+        assert received == {
+            "question": "Pick any",
+            "choices": ["A", "B", "C"],
+            "multiple": True,
+        }
+        assert result["multiple"] is True
+        assert result["user_response"] == "A, C"
+
+    def test_schema_exposes_multiple_selection_flag(self):
+        multiple = CLARIFY_SCHEMA["parameters"]["properties"]["multiple"]
+        assert multiple["type"] == "boolean"
+
     def test_empty_question_returns_error(self):
         """Should return error for empty question."""
         result = json.loads(clarify_tool("", callback=lambda q, c: "ignored"))

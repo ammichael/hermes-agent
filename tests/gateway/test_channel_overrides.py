@@ -41,6 +41,7 @@ class TestGetChannelOverride:
             model="openrouter/healer-alpha",
             provider="openrouter",
             system_prompt="You are a summarizer.",
+            reasoning_effort="high",
         )
         config = GatewayConfig(
             platforms={
@@ -55,6 +56,75 @@ class TestGetChannelOverride:
         assert result.model == "openrouter/healer-alpha"
         assert result.provider == "openrouter"
         assert result.system_prompt == "You are a summarizer."
+        assert result.reasoning_effort == "high"
+
+    def test_reasoning_effort_round_trips(self):
+        override = ChannelOverride.from_dict({"reasoning_effort": "high"})
+        assert override.reasoning_effort == "high"
+        assert override.to_dict()["reasoning_effort"] == "high"
+
+
+class TestResolveReasoningForChannel:
+    def test_channel_override_beats_global_and_per_model(self, monkeypatch):
+        runner = object.__new__(GatewayRunner)
+        runner._session_reasoning_overrides = {}
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.WHATSAPP: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "product-loop": ChannelOverride(reasoning_effort="high"),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="product-loop",
+            chat_type="group",
+        )
+        monkeypatch.setattr(
+            GatewayRunner,
+            "_load_reasoning_config",
+            staticmethod(lambda _model="": {"enabled": True, "effort": "medium"}),
+        )
+
+        result = runner._resolve_session_reasoning_config(
+            source=source,
+            session_key="agent:main:whatsapp:group:product-loop",
+            model="gpt-5.6-sol",
+        )
+
+        assert result == {"enabled": True, "effort": "high"}
+
+    def test_session_override_still_beats_channel_override(self):
+        runner = object.__new__(GatewayRunner)
+        session_key = "agent:main:whatsapp:group:product-loop"
+        runner._session_reasoning_overrides = {
+            session_key: {"enabled": True, "effort": "low"}
+        }
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.WHATSAPP: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "product-loop": ChannelOverride(reasoning_effort="high"),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="product-loop",
+            chat_type="group",
+        )
+
+        result = runner._resolve_session_reasoning_config(
+            source=source,
+            session_key=session_key,
+        )
+
+        assert result == {"enabled": True, "effort": "low"}
 
     def test_returns_override_when_chat_id_is_int_like(self):
         """Caller may pass str(chat_id); override keys are normalized to str."""
