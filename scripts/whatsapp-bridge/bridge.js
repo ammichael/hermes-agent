@@ -9,6 +9,7 @@
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
+ *   POST /profile-status - Update this account's About text { status }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
@@ -840,6 +841,30 @@ app.post('/send', async (req, res) => {
       messageId: messageIds[messageIds.length - 1],
       messageIds,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update this WhatsApp account's profile About/status text.
+app.post('/profile-status', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const status = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
+  if (!status) {
+    return res.status(400).json({ error: 'status is required' });
+  }
+  if (Array.from(status).length > 139) {
+    return res.status(400).json({ error: 'status must be at most 139 characters' });
+  }
+
+  try {
+    await sock.updateProfileStatus(status);
+    const ownJid = jidNormalizedUser(sock.user?.id || '');
+    const readback = ownJid ? await sock.fetchStatus(ownJid) : undefined;
+    res.json({ success: true, status, readback: readback || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
