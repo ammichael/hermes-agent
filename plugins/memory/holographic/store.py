@@ -3,8 +3,10 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import os
 import re
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 
@@ -139,6 +141,7 @@ class MemoryStore:
         with MemoryStore._shared_guard:
             entry = MemoryStore._shared.get(self._key)
             if entry is None:
+                self._secure_database_file()
                 conn = sqlite3.connect(
                     self._key,
                     check_same_thread=False,
@@ -161,7 +164,30 @@ class MemoryStore:
         with self._lock:
             if not self._entry["ready"]:
                 self._init_db()
+                self._secure_sqlite_sidecars()
                 self._entry["ready"] = True
+
+    def _secure_database_file(self) -> None:
+        """Create/tighten the private fact database before SQLite opens it."""
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self._key, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("memory database path is not a regular file")
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+
+    def _secure_sqlite_sidecars(self) -> None:
+        """Tighten WAL/SHM/journal files left by earlier permissive versions."""
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = self._key + suffix
+            try:
+                os.chmod(sidecar, 0o600, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
 
     # ------------------------------------------------------------------
     # Initialisation

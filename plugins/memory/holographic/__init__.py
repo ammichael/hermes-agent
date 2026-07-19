@@ -10,8 +10,12 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
     hermes-memory-store:
       db_path: $HERMES_HOME/memory_store.db   # omit to use the default
       auto_extract: false
+      auto_prefetch: false
+      mirror_memory_writes: false
       default_trust: 0.5
       min_trust_threshold: 0.3
+      prefetch_min_score: 0.25
+      prefetch_limit: 2
       temporal_decay_half_life: 0
 """
 
@@ -29,6 +33,35 @@ from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse config booleans without treating the string ``false`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
+def _bounded_float(value: Any, default: float, low: float, high: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, parsed))
+
+
+def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, parsed))
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +82,9 @@ FACT_STORE_SCHEMA = {
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
         "• update/remove/list — CRUD operations.\n\n"
-        "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
+        "When the answer depends on durable facts not present in built-in memory, "
+        "probe or reason before answering. Add only explicit, reviewed facts and include "
+        "source/scope aliases in tags."
     ),
     "parameters": {
         "type": "object",
@@ -119,7 +154,20 @@ class HolographicMemoryProvider(MemoryProvider):
         self._config = config or _load_plugin_config()
         self._store = None
         self._retriever = None
-        self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        self._min_trust = _bounded_float(
+            self._config.get("min_trust_threshold", 0.3), 0.3, 0.0, 1.0
+        )
+        self._auto_extract = _as_bool(self._config.get("auto_extract"), False)
+        self._auto_prefetch = _as_bool(self._config.get("auto_prefetch"), False)
+        self._mirror_memory_writes = _as_bool(
+            self._config.get("mirror_memory_writes"), False
+        )
+        self._prefetch_min_score = _bounded_float(
+            self._config.get("prefetch_min_score", 0.25), 0.25, 0.0, 1.0
+        )
+        self._prefetch_limit = _bounded_int(
+            self._config.get("prefetch_limit", 2), 2, 1, 5
+        )
 
     @property
     def name(self) -> str:
@@ -151,6 +199,10 @@ class HolographicMemoryProvider(MemoryProvider):
         return [
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_prefetch", "description": "Inject matching facts before every turn", "default": "false", "choices": ["true", "false"]},
+            {"key": "mirror_memory_writes", "description": "Mirror built-in memory additions into the fact store", "default": "false", "choices": ["true", "false"]},
+            {"key": "prefetch_min_score", "description": "Minimum relevance score for automatic injection", "default": "0.25"},
+            {"key": "prefetch_limit", "description": "Maximum facts automatically injected per turn", "default": "2"},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
@@ -204,10 +256,18 @@ class HolographicMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._retriever or not query:
+        if not self._auto_prefetch or not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            candidates = self._retriever.search(
+                query,
+                min_trust=self._min_trust,
+                limit=self._prefetch_limit * 3,
+            )
+            results = [
+                result for result in candidates
+                if float(result.get("score", 0.0)) >= self._prefetch_min_score
+            ][:self._prefetch_limit]
             if not results:
                 return ""
             lines = []
@@ -235,7 +295,7 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._config.get("auto_extract", False):
+        if not self._auto_extract:
             return
         if not self._store or not messages:
             return
@@ -243,7 +303,12 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
+        if (
+            self._mirror_memory_writes
+            and action == "add"
+            and self._store
+            and content
+        ):
             try:
                 category = "user_pref" if target == "user" else "general"
                 self._store.add_fact(content, category=category)

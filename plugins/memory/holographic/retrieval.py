@@ -553,17 +553,19 @@ class FactRetriever:
         """
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
+        # Split on whitespace, lowercase, strip punctuation and function words.
+        # Keeping the same normalization here and in the FTS sanitizer prevents
+        # Portuguese articles/pronouns from inflating Jaccard relevance.
         tokens = set()
         for word in text.lower().split():
             cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
+            if cleaned and cleaned not in FactRetriever._FTS_STOPWORDS:
                 tokens.add(cleaned)
         return tokens
 
-    # Stopwords dropped before FTS5 OR-expansion. Short English function
-    # words that carry no retrieval signal and force false-negative AND
-    # matches when left in the query.
+    # Stopwords dropped before FTS5 OR-expansion. English and Portuguese
+    # function words carry little retrieval signal and otherwise create
+    # false-positive OR matches for conversational PT-BR queries.
     _FTS_STOPWORDS = frozenset({
         "a", "about", "above", "after", "again", "all", "am", "an", "and",
         "any", "are", "as", "at", "be", "because", "been", "before", "being",
@@ -580,6 +582,18 @@ class FactRetriever:
         "until", "up", "very", "was", "we", "were", "what", "when", "where",
         "which", "while", "who", "whom", "why", "will", "with", "would",
         "you", "your", "yours", "yourself", "yourselves",
+        # Portuguese (keep polarity terms such as não, nunca and sem).
+        "a", "à", "às", "ao", "aos", "as", "até", "com", "como", "da",
+        "das", "de", "dela", "delas", "dele", "deles", "do", "dos", "e",
+        "ela", "elas", "ele", "eles", "em", "entre", "era", "eram", "essa",
+        "essas", "esse", "esses", "esta", "está", "estão", "estas", "este",
+        "estes", "eu", "foi", "foram", "há", "isso", "isto", "já", "lhe",
+        "lhes", "mais", "mas", "me", "meu", "meus", "minha", "minhas", "na",
+        "nas", "nem", "no", "nos", "nós", "o", "os", "ou", "para", "pela",
+        "pelas", "pelo", "pelos", "por", "pra", "pro", "qual", "quais", "que",
+        "quem", "se", "seu", "seus", "só", "sua", "suas", "também", "te",
+        "tem", "têm", "tendo", "ter", "teve", "tu", "tua", "tuas", "tudo",
+        "um", "uma", "umas", "uns", "você", "vocês",
     })
 
     @classmethod

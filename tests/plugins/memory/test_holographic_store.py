@@ -11,7 +11,9 @@ visibility, concurrent multi-instance writers, and write-lock release after
 a failed write.
 """
 
+import os
 import sqlite3
+import stat
 import threading
 
 import pytest
@@ -43,6 +45,29 @@ def _clean_shared_registry():
 @pytest.fixture
 def db_path(tmp_path):
     return tmp_path / "memory_store.db"
+
+
+class TestDatabasePermissions:
+    def test_new_database_is_owner_only(self, db_path):
+        with MemoryStore(db_path):
+            pass
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    def test_existing_database_permissions_are_tightened(self, db_path):
+        db_path.touch(mode=0o644)
+        os.chmod(db_path, 0o644)
+        with MemoryStore(db_path):
+            pass
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    def test_sqlite_sidecars_are_owner_only(self, db_path):
+        with MemoryStore(db_path):
+            sidecars = [
+                path for suffix in ("-wal", "-shm", "-journal")
+                if (path := db_path.with_name(db_path.name + suffix)).exists()
+            ]
+            assert sidecars
+            assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sidecars)
 
 
 class TestSharedConnection:

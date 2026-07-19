@@ -34,6 +34,10 @@ from plugins.memory.holographic.store import MemoryStore
         ("context: length-probe", {"context", "lengthprobe"}),
         # trailing punctuation stripped by tokenizer
         ("hello, world!", {"hello", "world"}),
+        # Portuguese function words are dropped; content words remain.
+        ("Como ele gosta que eu responda?", {"gosta", "responda"}),
+        # Portuguese identity/entity terms survive sanitization.
+        ("quem é Bia", {"bia"}),
     ],
 )
 def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
