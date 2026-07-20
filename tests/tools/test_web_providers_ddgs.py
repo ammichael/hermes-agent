@@ -18,15 +18,12 @@ import pytest
 from tests.tools.conftest import register_all_web_providers
 
 
-def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text_sleep=None):
+def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None):
     """Install a stub ``ddgs`` module in sys.modules for the duration of a test.
 
     ``text_results``: iterable of dicts to yield from DDGS().text(...).
     ``text_raises``: if set, DDGS().text raises this exception instead.
-    ``text_sleep``: if set, DDGS().text blocks for this many seconds before
-        yielding — simulates a hung/slow search for the timeout test.
     """
-    import time as _time
 
     fake = types.ModuleType("ddgs")
 
@@ -40,8 +37,6 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
         def __exit__(self, *_a):
             return False
         def text(self, query, max_results=5):
-            if text_sleep is not None:
-                _time.sleep(text_sleep)
             if text_raises is not None:
                 raise text_raises
             for hit in (text_results or []):
@@ -50,6 +45,40 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
     fake.DDGS = _FakeDDGS
     monkeypatch.setitem(sys.modules, "ddgs", fake)
     return fake
+
+
+def _run_fake_ddgs_inline(monkeypatch, provider_class):
+    """Keep normalization unit tests in-process; isolation has dedicated tests."""
+    search_globals = provider_class.search.__globals__
+    monkeypatch.setitem(
+        search_globals,
+        "_run_ddgs_search_isolated",
+        search_globals["_run_ddgs_search"],
+    )
+
+
+def _native_gil_blocking_worker(send_conn, query, safe_limit):
+    """Hold the child interpreter's GIL in native code until the parent kills it."""
+    import ctypes
+    import sys
+
+    if sys.platform == "win32":
+        kernel32 = ctypes.PyDLL("kernel32.dll")
+        kernel32.Sleep.argtypes = [ctypes.c_uint32]
+        kernel32.Sleep.restype = None
+        kernel32.Sleep(60_000)
+    else:
+        ctypes.PyDLL(None).sleep(60)
+
+
+def _successful_envelope_worker(send_conn, query, safe_limit):
+    send_conn.send(("ok", [{"title": query, "position": safe_limit}]))
+    send_conn.close()
+
+
+def _error_envelope_worker(send_conn, query, safe_limit):
+    send_conn.send(("error", "RuntimeError: isolated boom"))
+    send_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +128,7 @@ class TestDDGSProviderSearch:
             {"title": "C", "href": "https://c.example.com", "body": "desc C"},
         ])
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("q", limit=5)
 
@@ -113,6 +143,7 @@ class TestDDGSProviderSearch:
             {"title": "A", "url": "https://a.example.com", "body": "desc A"},
         ])
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("q", limit=5)
 
@@ -125,6 +156,7 @@ class TestDDGSProviderSearch:
             for i in range(10)
         ])
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("q", limit=3)
 
@@ -152,6 +184,7 @@ class TestDDGSProviderSearch:
     def test_runtime_error_returns_failure(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_raises=RuntimeError("rate limited 202"))
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("q", limit=5)
         assert result["success"] is False
@@ -160,45 +193,133 @@ class TestDDGSProviderSearch:
     def test_empty_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[])
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is True
         assert result["data"]["web"] == []
 
     def test_hung_search_times_out_and_returns_failure(self, monkeypatch):
-        """#36776: a ddgs call that never returns must be bounded by the
-        wall-clock timeout and surface a failure instead of hanging the
-        shared agent loop. We patch the blocking helper to wait on an Event
-        (released in finally so no worker thread leaks past the test) and
-        shrink the timeout; search() must return success=False promptly."""
+        """The provider maps an isolated-worker deadline to a useful tool error."""
+        import plugins.web.ddgs.provider as _prov
+
+        _install_fake_ddgs(monkeypatch)
+
+        def _timeout(query, safe_limit):
+            raise _prov._DDGSSearchTimeout
+
+        monkeypatch.setattr(_prov, "_run_ddgs_search_isolated", _timeout)
+        monkeypatch.setattr(_prov, "_SEARCH_TIMEOUT_SECS", 0.3)
+
+        result = _prov.DDGSWebSearchProvider().search("hangs forever", limit=5)
+
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+
+    def test_interrupted_search_returns_interrupted_error(self, monkeypatch):
+        import plugins.web.ddgs.provider as _prov
+
+        _install_fake_ddgs(monkeypatch)
+
+        def _interrupted(query, safe_limit):
+            raise _prov._DDGSSearchInterrupted
+
+        monkeypatch.setattr(_prov, "_run_ddgs_search_isolated", _interrupted)
+
+        result = _prov.DDGSWebSearchProvider().search("cancel me", limit=5)
+
+        assert result == {"success": False, "error": "Interrupted"}
+
+    def test_isolation_times_out_native_worker_holding_gil(self):
+        """Regression: native code holding the child GIL cannot freeze Hermes."""
+        import multiprocessing
+        import time
+
+        import plugins.web.ddgs.provider as _prov
+
+        start = time.monotonic()
+        with pytest.raises(_prov._DDGSSearchTimeout):
+            _prov._run_ddgs_search_isolated(
+                "native hang",
+                5,
+                timeout=0.3,
+                worker_target=_native_gil_blocking_worker,
+            )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 3.0, f"isolated search did not return promptly ({elapsed:.1f}s)"
+        assert not any(
+            child.name == "hermes-ddgs-search"
+            for child in multiprocessing.active_children()
+        )
+
+    def test_isolation_interrupts_and_reaps_native_worker_promptly(self):
+        """Gateway/TUI cancellation must not wait for the full search timeout."""
+        import multiprocessing
         import threading
         import time
 
-        # ddgs must import-probe True for search() to proceed.
-        _install_fake_ddgs(monkeypatch)
-        monkeypatch.delitem(sys.modules, "plugins.web.ddgs.provider", raising=False)
         import plugins.web.ddgs.provider as _prov
+        from tools.interrupt import set_interrupt
 
-        release = threading.Event()
-
-        def _blocking_search(query, safe_limit):
-            release.wait(timeout=10)  # bounded so the worker can never truly leak
-            return []
-
-        monkeypatch.setattr(_prov, "_run_ddgs_search", _blocking_search, raising=True)
-        monkeypatch.setattr(_prov, "_SEARCH_TIMEOUT_SECS", 0.3, raising=True)
-
+        owner_thread = threading.get_ident()
+        interrupter = threading.Timer(0.1, set_interrupt, args=(True, owner_thread))
+        interrupter.start()
         try:
             start = time.monotonic()
-            result = _prov.DDGSWebSearchProvider().search("hangs forever", limit=5)
+            with pytest.raises(_prov._DDGSSearchInterrupted):
+                _prov._run_ddgs_search_isolated(
+                    "interrupt native hang",
+                    5,
+                    timeout=10,
+                    worker_target=_native_gil_blocking_worker,
+                )
             elapsed = time.monotonic() - start
-
-            assert result["success"] is False
-            assert "timed out" in result["error"].lower()
-            # Returned well before the worker's 10s wait — proves the cap fired.
-            assert elapsed < 3.0, f"search did not return promptly ({elapsed:.1f}s)"
         finally:
-            release.set()  # let the orphaned worker finish immediately
+            interrupter.cancel()
+            set_interrupt(False, owner_thread)
+
+        assert elapsed < 2.0, f"interrupt did not stop the worker promptly ({elapsed:.1f}s)"
+        assert not any(
+            child.name == "hermes-ddgs-search"
+            for child in multiprocessing.active_children()
+        )
+
+    def test_isolation_decodes_success_envelope_and_reaps_worker(self):
+        import multiprocessing
+
+        import plugins.web.ddgs.provider as _prov
+
+        result = _prov._run_ddgs_search_isolated(
+            "spawned result",
+            3,
+            timeout=3,
+            worker_target=_successful_envelope_worker,
+        )
+
+        assert result == [{"title": "spawned result", "position": 3}]
+        assert not any(
+            child.name == "hermes-ddgs-search"
+            for child in multiprocessing.active_children()
+        )
+
+    def test_isolation_decodes_error_envelope_and_reaps_worker(self):
+        import multiprocessing
+
+        import plugins.web.ddgs.provider as _prov
+
+        with pytest.raises(RuntimeError, match="isolated boom"):
+            _prov._run_ddgs_search_isolated(
+                "spawned error",
+                3,
+                timeout=3,
+                worker_target=_error_envelope_worker,
+            )
+
+        assert not any(
+            child.name == "hermes-ddgs-search"
+            for child in multiprocessing.active_children()
+        )
 
     def test_fast_search_not_affected_by_timeout_wrapper(self, monkeypatch):
         """Happy-path guard: the timeout wrapper must not break a normal,
@@ -208,6 +329,7 @@ class TestDDGSProviderSearch:
             text_results=[{"title": "T", "href": "https://e.com", "body": "B"}],
         )
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        _run_fake_ddgs_inline(monkeypatch, DDGSWebSearchProvider)
 
         result = DDGSWebSearchProvider().search("q", limit=5)
         assert result["success"] is True
