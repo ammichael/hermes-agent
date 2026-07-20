@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -58,6 +59,7 @@ def finalize_turn(
     _should_review_memory,
     _turn_exit_reason,
     _pending_verification_response=None,
+    _turn_performance=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -65,6 +67,8 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    _finalization_started = time.monotonic()
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -577,5 +581,21 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    if _turn_performance is not None:
+        try:
+            _turn_performance.finalize(
+                api_call_count=api_call_count,
+                exit_reason=_turn_exit_reason,
+                completed=completed,
+                finalization_ms=max(
+                    0,
+                    int((time.monotonic() - _finalization_started) * 1000),
+                ),
+            )
+        except Exception:
+            # Performance telemetry is deliberately best-effort and cannot
+            # affect delivery or durable conversation state.
+            pass
 
     return result

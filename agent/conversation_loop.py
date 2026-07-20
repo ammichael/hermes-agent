@@ -25,7 +25,7 @@ import ssl
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
@@ -585,13 +585,13 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def run_conversation(
+def _run_conversation_impl(
     agent,
     user_message: Any,
-    system_message: str = None,
-    conversation_history: List[Dict[str, Any]] = None,
-    task_id: str = None,
-    stream_callback: Optional[callable] = None,
+    system_message: Optional[str] = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    task_id: Optional[str] = None,
+    stream_callback: Optional[Callable[..., Any]] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
@@ -711,6 +711,35 @@ def run_conversation(
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+
+    # Content-free timing only: no prompts, messages, tool args/results, raw
+    # identities, or local paths enter the accumulator. Telemetry is
+    # best-effort and must never fail or delay a user turn.
+    _turn_performance = getattr(agent, "_turn_performance_telemetry", None)
+    if _turn_performance is not None:
+        try:
+            _turn_performance.mark_prologue_complete()
+        except Exception:
+            pass
+
+    def _compress_with_performance(*args, **kwargs):
+        _compression_started = time.monotonic()
+        try:
+            return agent._compress_context(*args, **kwargs)
+        finally:
+            if _turn_performance is not None:
+                try:
+                    _turn_performance.record_compression(
+                        duration_ms=max(
+                            0,
+                            int(
+                                (time.monotonic() - _compression_started)
+                                * 1000
+                            ),
+                        )
+                    )
+                except Exception:
+                    pass
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -1147,7 +1176,7 @@ def run_conversation(
                 f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
                 f"near the context/output limit. Compacting before the next model call."
             )
-            messages, active_system_prompt = agent._compress_context(
+            messages, active_system_prompt = _compress_with_performance(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
@@ -1390,8 +1419,16 @@ def run_conversation(
                 # consumers are registered, and falls back to non-
                 # streaming automatically if the provider doesn't
                 # support it.
+                _first_delta_ms = None
+                _attempt_started = time.monotonic()
+
                 def _stop_spinner():
-                    nonlocal thinking_spinner
+                    nonlocal thinking_spinner, _first_delta_ms
+                    if _first_delta_ms is None:
+                        _first_delta_ms = max(
+                            0,
+                            int((time.monotonic() - _attempt_started) * 1000),
+                        )
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -1448,22 +1485,43 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
-                )
+                response = None
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                finally:
+                    if _turn_performance is not None:
+                        try:
+                            _turn_performance.record_model_call(
+                                duration_ms=max(
+                                    0,
+                                    int(
+                                        (time.monotonic() - _attempt_started)
+                                        * 1000
+                                    ),
+                                ),
+                                ttft_ms=_first_delta_ms,
+                                success=response is not None,
+                                provider=agent.provider,
+                                model=agent.model,
+                                request_chars=total_chars,
+                            )
+                        except Exception:
+                            pass
                 
                 api_duration = time.time() - api_start_time
                 
@@ -3297,7 +3355,7 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
+                        messages, active_system_prompt = _compress_with_performance(
                             messages, system_message,
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
@@ -3552,7 +3610,7 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = _compress_with_performance(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
@@ -3793,7 +3851,7 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = _compress_with_performance(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
@@ -5052,7 +5110,35 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _tool_message_start = len(messages)
+                _tool_batch_started = time.monotonic()
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    if _turn_performance is not None:
+                        try:
+                            from agent.performance_telemetry import summarize_tool_messages
+
+                            _tool_metrics = summarize_tool_messages(
+                                messages[_tool_message_start:]
+                            )
+                            _turn_performance.record_tool_batch(
+                                duration_ms=max(
+                                    0,
+                                    int(
+                                        (time.monotonic() - _tool_batch_started)
+                                        * 1000
+                                    ),
+                                ),
+                                **_tool_metrics,
+                            )
+                        except Exception:
+                            pass
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -5135,7 +5221,7 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = _compress_with_performance(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
@@ -5773,8 +5859,71 @@ def run_conversation(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
+        _turn_performance=_turn_performance,
     )
 
+
+def run_conversation(
+    agent,
+    user_message: Any,
+    system_message: Optional[str] = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    task_id: Optional[str] = None,
+    stream_callback: Optional[Callable[..., Any]] = None,
+    persist_user_message: Optional[Any] = None,
+    persist_user_timestamp: Optional[float] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one turn and finalize content-free telemetry on every exit path."""
+    telemetry = None
+    previous_telemetry = getattr(agent, "_turn_performance_telemetry", None)
+    try:
+        from agent.performance_telemetry import TurnPerformanceTelemetry
+
+        telemetry = TurnPerformanceTelemetry(
+            session_id=getattr(agent, "session_id", None) or "",
+            started_monotonic=time.monotonic(),
+        )
+    except Exception:
+        telemetry = None
+
+    agent._turn_performance_telemetry = telemetry
+    result = None
+    try:
+        result = _run_conversation_impl(
+            agent,
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            moa_config=moa_config,
+        )
+        return result
+    finally:
+        if telemetry is not None and not telemetry.is_finalized:
+            try:
+                result_dict = result if isinstance(result, dict) else {}
+                telemetry.finalize(
+                    api_call_count=result_dict.get(
+                        "api_calls", getattr(agent, "_api_call_count", 0)
+                    ),
+                    exit_reason=result_dict.get("turn_exit_reason") or (
+                        "early_return" if result is not None else "exception"
+                    ),
+                    completed=bool(result_dict.get("completed", False)),
+                )
+            except Exception:
+                pass
+        if previous_telemetry is None:
+            try:
+                delattr(agent, "_turn_performance_telemetry")
+            except AttributeError:
+                pass
+        else:
+            agent._turn_performance_telemetry = previous_telemetry
 
 
 __all__ = ["run_conversation"]
