@@ -43,6 +43,10 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.inference_roles import (
+    resolve_inference_role,
+    validate_inference_role_job_fields,
+)
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
@@ -3122,6 +3126,28 @@ def run_job(
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+        # Resolve purpose-level cron routing after config is loaded. Jobs store
+        # ``model: role:<purpose>`` while the concrete route lives in config,
+        # so one scalar role change can move every matching job together.
+        validate_inference_role_job_fields(
+            model,
+            job.get("provider"),
+            job.get("base_url"),
+        )
+        _role_route = resolve_inference_role(model, _cfg)
+        _role_provider = None
+        _role_base_url = None
+        if _role_route is not None:
+            model = str(_role_route["model"])
+            _role_provider = str(_role_route["provider"])
+            _role_base_url = _role_route.get("base_url")
+            logger.info(
+                "Job '%s': inference role %s resolved via route %s",
+                job_id,
+                _role_route["role"],
+                _role_route["route"],
+            )
+
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
@@ -3190,7 +3216,13 @@ def run_job(
         # job persisted before that guard — or written directly to the jobs store
         # — reaches this sink unchecked. Fail closed before resolution so no
         # off-host call is ever made with a stored key.
-        _guard_job_credential_exfil(job)
+        _guard_job_credential_exfil(
+            {
+                **job,
+                "provider": _role_provider or job.get("provider"),
+                "base_url": _role_base_url or job.get("base_url"),
+            }
+        )
 
         primary_model_for_drift = model
         configured_provider_for_drift = (
@@ -3199,7 +3231,7 @@ def run_job(
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
+            str(_role_provider or job.get("provider") or "").strip().lower()
             or configured_provider_for_drift
             or None
         )
@@ -3210,15 +3242,17 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": _role_provider or job.get("provider"),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
                 # below, which already passes its fb_model.
                 "target_model": model,
             }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            if _role_base_url or job.get("base_url"):
+                runtime_kwargs["explicit_base_url"] = (
+                    _role_base_url or job.get("base_url")
+                )
             runtime = resolve_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()

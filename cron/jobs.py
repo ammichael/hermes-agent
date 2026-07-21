@@ -39,6 +39,10 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from hermes_cli.inference_roles import (
+    is_inference_role_reference,
+    validate_inference_role_job_fields,
+)
 from utils import atomic_replace
 
 try:
@@ -1036,6 +1040,12 @@ def _compute_provider_model_snapshots(
     )
     if bool(no_agent):
         return None, None
+    # A role reference is an intentional, purpose-level pin. Its concrete
+    # provider/model may change through config without rewriting every job, so
+    # creation-time drift snapshots would defeat the feature by blocking the
+    # next run after an approved role-route change.
+    if is_inference_role_reference(normalized_model):
+        return None, None
 
     provider_snapshot: Optional[str] = None
     model_snapshot: Optional[str] = None
@@ -1163,6 +1173,11 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    validate_inference_role_job_fields(
+        normalized_model,
+        normalized_provider,
+        normalized_base_url,
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1358,6 +1373,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            validate_inference_role_job_fields(
+                updated.get("model"),
+                updated.get("provider"),
+                updated.get("base_url"),
+            )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

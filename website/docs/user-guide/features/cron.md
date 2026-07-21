@@ -25,6 +25,45 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 At creation, an unpinned job (one you don't give an explicit `provider`/`model`) follows the global default selected by `hermes model` — and Hermes **snapshots** that provider and model on the job. If the global default later changes, the job **fails closed**: it skips the run, makes no inference call, and sends an alert telling you to pin the provider/model explicitly (`cronjob action=update job_id=… provider=… model=…`) to proceed. This prevents an unattended job from silently inheriting a switch to a paid provider/model and spending money you didn't intend (#44585). To make a job deliberately track your global default, pin it to the new values after changing them. `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
 :::
 
+### Route jobs by purpose instead of model name
+
+For installations that operate many jobs, use a purpose reference such as
+`role:routine` in the job's model field. The role resolves fresh on every run
+through a named route in `config.yaml`:
+
+```yaml
+inference:
+  roles:
+    routine: codex-luna
+    balanced: codex-terra
+    frontier: codex-sol
+  routes:
+    codex-luna:
+      provider: openai-codex
+      model: gpt-5.6-luna
+      base_url: https://chatgpt.com/backend-api/codex
+    codex-terra:
+      provider: openai-codex
+      model: gpt-5.6-terra
+      base_url: https://chatgpt.com/backend-api/codex
+    codex-sol:
+      provider: openai-codex
+      model: gpt-5.6-sol
+      base_url: https://chatgpt.com/backend-api/codex
+```
+
+Create or update the job with `model: {model: "role:routine"}` and omit its
+concrete provider/base URL. To move every routine job later, change only the
+role mapping:
+
+```bash
+hermes config set inference.roles.routine xai-grok45
+```
+
+Routes fail closed when the role, route, provider, or model is missing. A role
+job cannot also pin a provider or base URL because that would make ownership of
+the routing decision ambiguous.
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::

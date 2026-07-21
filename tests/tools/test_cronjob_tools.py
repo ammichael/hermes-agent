@@ -542,6 +542,16 @@ class TestResolveModelOverride:
     Regression for cron jobs with ``provider: "custom"`` falling back to codex.
     """
 
+    def test_role_reference_does_not_pin_current_provider(self, monkeypatch):
+        import hermes_cli.config as cfg_mod
+
+        monkeypatch.setattr(
+            cfg_mod, "load_config", lambda: {"model": {"provider": "openai-codex"}}
+        )
+        provider, model = _resolve_model_override({"model": "role:routine"})
+        assert provider is None
+        assert model == "role:routine"
+
     def test_keeps_bare_custom_when_a_named_entry_exists(self, monkeypatch):
         import hermes_cli.runtime_provider as rp_mod
 

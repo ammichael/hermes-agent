@@ -5550,6 +5550,7 @@ def check_config_version() -> Tuple[int, int]:
 _EXTRA_KNOWN_ROOT_KEYS = {
     "custom_providers",  # legacy list form; modern equivalent is providers: {}
     "fallback_model",    # optional single dict or chain list; omitted when disabled
+    "inference",         # purpose roles -> named provider/model routes for cron loops
     "mcp_servers",       # MCP server definitions written by setup/tools flows
     # Roots read from the raw user YAML (or written by our own flows) that are
     # intentionally absent from DEFAULT_CONFIG:
@@ -8570,6 +8571,7 @@ def _default_value_for_key(dotted_key: str):
 # or ``providers.openrouter.api_key`` without us needing to know server names.
 _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "providers",
+    "inference",
     "credential_pool_strategies",
     "mcp_servers",
     "hooks",

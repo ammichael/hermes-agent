@@ -385,6 +385,14 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
         return (None, None)
     model_name = (model_obj.get("model") or "").strip() or None
     provider_name = (model_obj.get("provider") or "").strip() or None
+    # ``role:<purpose>`` is intentionally resolved from config at fire time.
+    # Pinning today's main provider here would prevent a one-line role swap
+    # from moving the job to another provider later.
+    if model_name:
+        from hermes_cli.inference_roles import is_inference_role_reference
+
+        if is_inference_role_reference(model_name):
+            return (provider_name, model_name)
     # Bare "custom" is usually an incomplete spec — the canonical form is
     # "custom:<name>" matching a custom_providers entry, and LLMs frequently
     # supply the bare type because the schema does not advertise the
@@ -1024,7 +1032,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "model": {
                 "type": "object",
-                "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
+                "description": "Optional per-job model override. Use model='role:<purpose>' for purpose-based routing configured under inference.roles/routes; role jobs resolve fresh each run. Otherwise, if provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
                 "properties": {
                     "provider": {
                         "type": "string",
@@ -1032,7 +1040,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
+                        "description": "Concrete model name, or a purpose reference such as 'role:routine', 'role:balanced', 'role:critical', or 'role:frontier'."
                     }
                 },
                 "required": ["model"]
