@@ -7005,6 +7005,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
+    def _platform_home_target(
+        self, platform: "Platform"
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Return ``(chat_id, thread_id)`` for the platform home channel, if any."""
+        try:
+            cfg = getattr(self, "config", None)
+            if cfg is None:
+                return None
+            home = cfg.get_home_channel(platform)
+            if not home or not getattr(home, "chat_id", None):
+                return None
+            thread = getattr(home, "thread_id", None)
+            return str(home.chat_id), (str(thread) if thread else None)
+        except Exception:
+            return None
+
+    def _is_home_delivery_target(
+        self,
+        platform: "Platform",
+        chat_id: str,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        home = self._platform_home_target(platform)
+        if not home:
+            return False
+        home_chat, home_thread = home
+        if str(chat_id) != home_chat:
+            return False
+        if home_thread is None:
+            return True
+        return str(thread_id or "") == home_thread
+
     async def _redeliver_pending_obligations(self) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
@@ -7020,6 +7052,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rows that were mid-send or previously rejected carry a visible
         recovered-reply marker so a possible duplicate is labeled, never
         silent. Returns the number of redeliveries attempted.
+
+        Home-only recovered delivery (Mike, 2026-07-21):
+        When a platform home channel is configured, ``needs_marker`` recoveries
+        are **never** posted back into domain/work groups. They are rerouted
+        to HOME (deduped by content within the same sweep) so restart noise
+        stays on the control surface. Plain ``pending`` rows (send never
+        started) still go to the original chat — those are first deliveries,
+        not recovered spam.
         """
         try:
             from gateway.delivery_ledger import (
@@ -7048,6 +7088,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         redelivered = 0
+        # Dedupe identical recovered payloads rerouted to HOME in one sweep
+        # (e.g. the same provider-failure text owed to N/Hermes + N/FinayaOS).
+        home_recovered_seen: set[tuple[str, str]] = set()
         for row in claimed:
             try:
                 platform = Platform(row["platform"])
@@ -7062,41 +7105,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+
             content = row["content"]
-            if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
-            try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
-                )
-            except Exception as send_err:
-                logger.warning(
-                    "obligation %s: redelivery send raised: %s",
-                    row["obligation_id"], send_err,
-                )
-                result = None
-            try:
-                if result is not None and getattr(result, "success", False):
+            target_chat = str(row["chat_id"])
+            target_thread = row.get("thread_id")
+            origin_chat = target_chat
+            needs_marker = bool(row.get("needs_marker"))
+            skip_send = False
+
+            if needs_marker:
+                home = self._platform_home_target(platform)
+                if home and not self._is_home_delivery_target(
+                    platform, target_chat, target_thread
+                ):
+                    home_chat, home_thread = home
+                    dedupe_key = (platform.value, content)
+                    if dedupe_key in home_recovered_seen:
+                        # Identical recovered body already queued/sent to HOME
+                        # this sweep — clear the obligation without spamming.
+                        skip_send = True
+                        logger.info(
+                            "obligation %s: suppressed duplicate recovered "
+                            "redelivery from %s:%s (HOME already notified)",
+                            row["obligation_id"],
+                            row["platform"],
+                            origin_chat,
+                        )
+                    else:
+                        home_recovered_seen.add(dedupe_key)
+                        content = (
+                            f"{RECOVERED_MARKER}"
+                            f"(originally for `{origin_chat}` — not re-posted "
+                            f"to domain chats)\n\n"
+                            f"{content}"
+                        )
+                        target_chat = home_chat
+                        target_thread = home_thread
+                        logger.info(
+                            "obligation %s: rerouting recovered redelivery "
+                            "%s:%s → HOME %s",
+                            row["obligation_id"],
+                            row["platform"],
+                            origin_chat,
+                            home_chat,
+                        )
+                else:
+                    content = RECOVERED_MARKER + content
+
+            if skip_send:
+                try:
                     mark_delivered(row["obligation_id"])
                     redelivered += 1
-                    logger.info(
-                        "Redelivered recovered final response to %s:%s "
-                        "(obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"],
-                        row["obligation_id"], row["attempts"],
+                except Exception:
+                    logger.debug("delivery ledger update failed", exc_info=True)
+            else:
+                metadata = (
+                    {"thread_id": target_thread} if target_thread else None
+                )
+                try:
+                    result = await adapter.send(
+                        chat_id=target_chat,
+                        content=content,
+                        metadata=metadata,
                     )
-                else:
-                    mark_failed(
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                except Exception as send_err:
+                    logger.warning(
+                        "obligation %s: redelivery send raised: %s",
+                        row["obligation_id"], send_err,
                     )
-            except Exception:
-                logger.debug("delivery ledger update failed", exc_info=True)
+                    result = None
+                try:
+                    if result is not None and getattr(result, "success", False):
+                        mark_delivered(row["obligation_id"])
+                        redelivered += 1
+                        logger.info(
+                            "Redelivered recovered final response to %s:%s "
+                            "(obligation %s, attempt %d, origin=%s)",
+                            row["platform"], target_chat,
+                            row["obligation_id"], row["attempts"],
+                            origin_chat,
+                        )
+                    else:
+                        mark_failed(
+                            row["obligation_id"],
+                            str(getattr(result, "error", "") or "send failed"),
+                        )
+                except Exception:
+                    logger.debug("delivery ledger update failed", exc_info=True)
 
             # The answer reached (or was owed to) this session — don't ALSO
             # re-run the turn via the resume path.

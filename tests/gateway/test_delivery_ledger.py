@@ -192,8 +192,8 @@ class TestGatewayRedeliverySweep:
     """Drive the real GatewayRunner._redeliver_pending_obligations."""
 
     @staticmethod
-    def _runner(adapter=None):
-        from gateway.config import Platform
+    def _runner(adapter=None, home_chat=None, home_thread=None):
+        from gateway.config import HomeChannel, Platform, PlatformConfig
         from gateway.run import GatewayRunner
 
         runner = object.__new__(GatewayRunner)
@@ -203,6 +203,20 @@ class TestGatewayRedeliverySweep:
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
+        # Optional home channel — when set, marked recoveries are home-only.
+        cfg = MagicMock()
+        if home_chat:
+            cfg.get_home_channel = MagicMock(
+                return_value=HomeChannel(
+                    platform=Platform.SLACK,
+                    chat_id=home_chat,
+                    thread_id=home_thread,
+                    name="Home",
+                )
+            )
+        else:
+            cfg.get_home_channel = MagicMock(return_value=None)
+        runner.config = cfg
         return runner
 
     @staticmethod
@@ -244,6 +258,67 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
+
+    @pytest.mark.asyncio
+    async def test_marked_recovery_reroutes_to_home_not_domain_chat(self):
+        """When HOME is set, recovered marker deliveries never spam domain chats."""
+        _record(chat_id="C_DOMAIN", thread_id=None, content="provider failed")
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, home_chat="C_HOME")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 1
+        sent = adapter.send.call_args.kwargs
+        assert sent["chat_id"] == "C_HOME"
+        assert "C_DOMAIN" in sent["content"]
+        assert sent["content"].startswith(dl.RECOVERED_MARKER)
+        assert "provider failed" in sent["content"]
+        assert _row("ob-1")["state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_marked_recovery_dedupes_identical_bodies_to_home(self):
+        """Same recovered payload owed to 3 domain chats → 1 HOME notice."""
+        for i, chat in enumerate(("C_A", "C_B", "C_C"), start=1):
+            oid = f"ob-{i}"
+            _record(
+                oid=oid,
+                chat_id=chat,
+                thread_id=None,
+                content="⚠️ The model provider failed after retries.",
+                session_key=f"agent:main:slack:channel:{chat}",
+            )
+            dl.mark_attempting(oid)
+            _orphan(oid)
+
+        adapter = self._adapter()
+        runner = self._runner(adapter, home_chat="C_HOME")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 3  # all obligations cleared
+        assert adapter.send.await_count == 1  # one HOME send only
+        sent = adapter.send.call_args.kwargs
+        assert sent["chat_id"] == "C_HOME"
+        assert "provider failed" in sent["content"]
+        for i in range(1, 4):
+            assert _row(f"ob-{i}")["state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_pending_still_goes_to_original_chat_even_with_home(self):
+        """First-delivery pending rows are not recovered spam — keep original chat."""
+        _record(chat_id="C_DOMAIN", thread_id=None, content="real answer")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, home_chat="C_HOME")
+
+        await runner._redeliver_pending_obligations()
+
+        sent = adapter.send.call_args.kwargs
+        assert sent["chat_id"] == "C_DOMAIN"
+        assert sent["content"] == "real answer"
 
     @pytest.mark.asyncio
     async def test_send_failure_marks_failed_for_next_boot(self):

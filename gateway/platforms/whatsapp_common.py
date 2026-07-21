@@ -326,6 +326,34 @@ class WhatsAppBehaviorMixin:
                 return True
         return False
 
+    def _message_mentioned_ids(self, data: Dict[str, Any]) -> set[str]:
+        return {
+            nid
+            for candidate in (data.get("mentionedIds") or [])
+            if (nid := self._normalize_whatsapp_id(candidate))
+        }
+
+    def _message_has_exclusive_non_bot_mentions(self, data: Dict[str, Any]) -> bool:
+        """True when the message @mentions someone else and not the bot.
+
+        Used in free-response groups: Mike may still address N without an
+        @mention, but an exclusive third-party tag means the message is for
+        that person — N must stay silent.
+        """
+        mentioned_ids = self._message_mentioned_ids(data)
+        if not mentioned_ids:
+            return False
+        bot_ids = self._bot_ids_from_message(data)
+        if not bot_ids:
+            # Without bot identity we cannot prove exclusivity; fail open to
+            # free-response behaviour rather than swallowing all tagged msgs.
+            return False
+        if mentioned_ids & bot_ids:
+            return False
+        if self._message_mentions_bot(data):
+            return False
+        return True
+
     def _message_matches_mention_patterns(self, data: Dict[str, Any]) -> bool:
         if not self._mention_patterns:
             return False
@@ -344,6 +372,17 @@ class WhatsAppBehaviorMixin:
                     rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned
                 )
         return cleaned.strip() or text
+
+    def _group_trigger_allows(self, data: Dict[str, Any]) -> bool:
+        """Shared group trigger checks (slash, reply-to-bot, @bot, patterns)."""
+        body = str(data.get("body") or "").strip()
+        if body.startswith("/"):
+            return True
+        if self._message_is_reply_to_bot(data):
+            return True
+        if self._message_mentions_bot(data):
+            return True
+        return self._message_matches_mention_patterns(data)
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         chat_id_raw = str(data.get("chatId") or "")
@@ -367,17 +406,22 @@ class WhatsAppBehaviorMixin:
         # Group messages: check mention / free-response settings
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
+            # Free-response means answer untagged chat — except when the
+            # message exclusively @mentions someone other than N.
+            if self._group_trigger_allows(data):
+                return True
+            if self._message_has_exclusive_non_bot_mentions(data):
+                return False
             return True
         if not self._whatsapp_require_mention():
+            # Same exclusive-tag exception even when mention is not required
+            # globally (open groups without free_response list).
+            if self._group_trigger_allows(data):
+                return True
+            if self._message_has_exclusive_non_bot_mentions(data):
+                return False
             return True
-        body = str(data.get("body") or "").strip()
-        if body.startswith("/"):
-            return True
-        if self._message_is_reply_to_bot(data):
-            return True
-        if self._message_mentions_bot(data):
-            return True
-        return self._message_matches_mention_patterns(data)
+        return self._group_trigger_allows(data)
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:
