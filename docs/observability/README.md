@@ -10,10 +10,6 @@ events, correlation IDs, sanitized payloads, timing, status, and error fields.
 They do not replace Hermes' planner, model providers, memory, tool registry,
 approval UX, CLI, gateway behavior, or execution semantics.
 
-For the local content-free turn-performance investigation, implementation,
-activation gate, and continuation plan, see
-[`turn-performance-optimization.md`](turn-performance-optimization.md).
-
 Behavior-changing request or execution wrappers are outside this observer
 contract. Observer hooks should report what happened; they should not replace
 provider requests, tool arguments, or execution callbacks.
