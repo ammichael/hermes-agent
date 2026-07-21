@@ -114,6 +114,34 @@ class TestConfigYamlRouting:
         config = _read_config(_isolated_hermes_home)
         assert "python:3.12" in config
 
+    def test_structured_mapping_preserves_dotted_map_keys(
+        self, _isolated_hermes_home, capsys
+    ):
+        """JSON object values must be stored as mappings, not scalar strings.
+
+        This is the supported way to configure open mappings whose keys contain
+        dots, such as model IDs in ``agent.reasoning_overrides``.
+        """
+        set_config_value(
+            "agent.reasoning_overrides",
+            '{"gpt-5.6-sol":"low"}',
+        )
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["agent"]["reasoning_overrides"] == {"gpt-5.6-sol": "low"}
+        assert "not a recognized config key" not in capsys.readouterr().out
+
+    def test_global_reasoning_effort_is_a_known_string_setting(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("agent.reasoning_effort", "low")
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["agent"]["reasoning_effort"] == "low"
+        assert "not a recognized config key" not in capsys.readouterr().out
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)

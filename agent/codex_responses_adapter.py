@@ -272,6 +272,7 @@ def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[L
 # "unsupported type".  Mirrors the ``*_call`` item-type set used in
 # _normalize_codex_response.
 _RESPONSES_BUILTIN_TOOL_TYPES = {
+    "tool_search",
     "web_search",
     "web_search_preview",
     "file_search",
@@ -820,6 +821,84 @@ def _preflight_codex_input_items(
     return normalized
 
 
+def _normalize_responses_tool_definition(
+    tool: Dict[str, Any],
+    *,
+    path: str,
+    allow_namespace: bool = True,
+) -> Dict[str, Any]:
+    """Validate one Responses tool while preserving hosted-search metadata."""
+
+    tool_type = tool.get("type")
+    if tool_type in _RESPONSES_BUILTIN_TOOL_TYPES:
+        return dict(tool)
+
+    if tool_type == "namespace":
+        if not allow_namespace:
+            raise ValueError(f"{path} cannot contain a nested namespace.")
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{path} is missing a valid namespace name.")
+        inner_tools = tool.get("tools")
+        if not isinstance(inner_tools, list) or not inner_tools:
+            raise ValueError(f"{path} namespace must contain a non-empty tools list.")
+        description = tool.get("description", "")
+        if description is None:
+            description = ""
+        if not isinstance(description, str):
+            description = str(description)
+        normalized_inner = []
+        for inner_idx, inner_tool in enumerate(inner_tools):
+            inner_path = f"{path}.tools[{inner_idx}]"
+            if not isinstance(inner_tool, dict):
+                raise ValueError(f"{inner_path} must be an object.")
+            if inner_tool.get("type") != "function":
+                raise ValueError(f"{inner_path} must be a function tool.")
+            normalized_inner.append(
+                _normalize_responses_tool_definition(
+                    inner_tool,
+                    path=inner_path,
+                    allow_namespace=False,
+                )
+            )
+        return {
+            "type": "namespace",
+            "name": name.strip(),
+            "description": description,
+            "tools": normalized_inner,
+        }
+
+    if tool_type != "function":
+        raise ValueError(f"{path} has unsupported type {tool_type!r}.")
+
+    name = tool.get("name")
+    parameters = tool.get("parameters")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{path} is missing a valid name.")
+    if not isinstance(parameters, dict):
+        raise ValueError(f"{path} is missing valid parameters.")
+
+    description = tool.get("description", "")
+    if description is None:
+        description = ""
+    if not isinstance(description, str):
+        description = str(description)
+    strict = tool.get("strict", False)
+    if not isinstance(strict, bool):
+        strict = bool(strict)
+
+    normalized = {
+        "type": "function",
+        "name": name.strip(),
+        "description": description,
+        "strict": strict,
+        "parameters": parameters,
+    }
+    if "defer_loading" in tool:
+        normalized["defer_loading"] = bool(tool.get("defer_loading"))
+    return normalized
+
+
 def _preflight_codex_api_kwargs(
     api_kwargs: Any,
     *,
@@ -860,49 +939,11 @@ def _preflight_codex_api_kwargs(
         for idx, tool in enumerate(tools):
             if not isinstance(tool, dict):
                 raise ValueError(f"Codex Responses tools[{idx}] must be an object.")
-
-            tool_type = tool.get("type")
-
-            # Provider-executed built-in tools (xAI native web_search, code
-            # interpreter, etc.) are declared by ``type`` alone and carry no
-            # ``name``/``parameters`` schema — the provider owns the
-            # implementation.  Pass them through verbatim instead of forcing
-            # them through the function-tool validation below (which would
-            # otherwise reject them with "unsupported type").  See
-            # agent/transports/codex.py for where xAI's native web_search is
-            # injected.
-            if tool_type in _RESPONSES_BUILTIN_TOOL_TYPES:
-                normalized_tools.append(dict(tool))
-                continue
-
-            if tool_type != "function":
-                raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool.get('type')!r}.")
-
-            name = tool.get("name")
-            parameters = tool.get("parameters")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"Codex Responses tools[{idx}] is missing a valid name.")
-            if not isinstance(parameters, dict):
-                raise ValueError(f"Codex Responses tools[{idx}] is missing valid parameters.")
-
-            description = tool.get("description", "")
-            if description is None:
-                description = ""
-            if not isinstance(description, str):
-                description = str(description)
-
-            strict = tool.get("strict", False)
-            if not isinstance(strict, bool):
-                strict = bool(strict)
-
             normalized_tools.append(
-                {
-                    "type": "function",
-                    "name": name.strip(),
-                    "description": description,
-                    "strict": strict,
-                    "parameters": parameters,
-                }
+                _normalize_responses_tool_definition(
+                    tool,
+                    path=f"Codex Responses tools[{idx}]",
+                )
             )
 
     store = api_kwargs.get("store", False)
@@ -1196,6 +1237,8 @@ def _normalize_codex_response(
     # calls keep their own in_progress handling below (they are skipped,
     # not awaited).
     _SERVER_SIDE_TOOL_CALL_TYPES = {
+        "tool_search_call",
+        "tool_search_output",
         "web_search_call",
         "file_search_call",
         "code_interpreter_call",

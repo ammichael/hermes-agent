@@ -60,6 +60,8 @@ def test_breakdown_keys_and_shape(isolated_home):
         assert data[key]["chars"] >= 0
     assert data["tools"]["count"] >= 0
     assert data["tools"]["json_bytes"] >= 0
+    assert isinstance(data["tools"]["per_tool"], list)
+    assert sum(item["json_bytes"] for item in data["tools"]["per_tool"]) == data["tools"]["json_bytes"]
     # System prompt is non-trivial even with empty home (identity + guidance).
     assert data["system_prompt"]["bytes"] > 0
 
@@ -161,6 +163,8 @@ def test_render_breakdown_is_plain_text(isolated_home):
     assert "System prompt total" in out
     assert "skills index" in out
     assert "Tool schemas" in out
+    if data["tools"]["per_tool"]:
+        assert "largest schemas" in out
     # Plain text — no JSON braces leaking in.
     assert not out.strip().startswith("{")
 

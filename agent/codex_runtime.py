@@ -1189,6 +1189,75 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
+
+    # OpenAI hosted tool search keeps the complete function schemas available
+    # while removing deferred definitions from the model's cold prompt.  Build
+    # this provider-specific wire shape *after* Hermes preflight has validated
+    # the ordinary Responses function array.  That keeps every other provider
+    # byte-identical and leaves the original kwargs ready for a one-shot
+    # compatibility fallback if the backend rejects namespaces/tool_search.
+    direct_api_kwargs = dict(api_kwargs)
+    request_api_kwargs = direct_api_kwargs
+    hosted_tool_search_active = False
+    hosted_tool_search_fallback_used = False
+    try:
+        from tools.hosted_tool_search import (
+            assemble_hosted_tools,
+            is_supported_runtime,
+            load_config as load_hosted_tool_search_config,
+        )
+
+        hosted_cfg = load_hosted_tool_search_config()
+        if hosted_cfg.enabled and is_supported_runtime(
+            provider=getattr(agent, "provider", ""),
+            model=str(api_kwargs.get("model") or getattr(agent, "model", "")),
+            base_url=getattr(agent, "base_url", ""),
+            api_mode=getattr(agent, "api_mode", ""),
+        ):
+            assembly = assemble_hosted_tools(
+                api_kwargs.get("tools"),
+                config=hosted_cfg,
+            )
+            if assembly.activated:
+                request_api_kwargs = dict(api_kwargs)
+                request_api_kwargs["tools"] = assembly.tools
+                # The routing key follows the actual static provider prefix,
+                # not the larger direct-schema fallback array.
+                from agent.transports.codex import _bounded_prompt_cache_key, _content_cache_key
+
+                hosted_cache_key = _content_cache_key(
+                    str(request_api_kwargs.get("instructions") or ""),
+                    assembly.tools,
+                )
+                if hosted_cache_key:
+                    request_api_kwargs["prompt_cache_key"] = (
+                        _bounded_prompt_cache_key(hosted_cache_key) or hosted_cache_key
+                    )
+                hosted_tool_search_active = True
+                logger.info(
+                    "Hosted tool search active: tools=%d namespaces=%d "
+                    "direct_schema_bytes=%d visible_projection_bytes=%d "
+                    "estimated_saved_tokens=%d model=%s",
+                    assembly.direct_tool_count,
+                    assembly.namespace_count,
+                    assembly.direct_schema_bytes,
+                    assembly.visible_schema_bytes,
+                    assembly.estimated_saved_tokens,
+                    api_kwargs.get("model", "unknown"),
+                )
+            elif assembly.reason not in {"disabled_or_empty", "no_function_tools"}:
+                logger.warning(
+                    "Hosted tool search not activated: reason=%s model=%s",
+                    assembly.reason,
+                    api_kwargs.get("model", "unknown"),
+                )
+    except Exception:
+        # Optimization failures must never remove tool availability.
+        logger.warning(
+            "Hosted tool search assembly failed; using direct schemas.",
+            exc_info=True,
+        )
+
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
@@ -1207,22 +1276,42 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
-    for attempt in range(max_stream_retries + 1):
+    transport_attempt = 0
+    while transport_attempt <= max_stream_retries:
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        stream_kwargs = dict(api_kwargs)
+        stream_kwargs = dict(request_api_kwargs)
         stream_kwargs["stream"] = True
 
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
-        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-            if attempt < max_stream_retries:
+        except Exception as exc:
+            if hosted_tool_search_active and not hosted_tool_search_fallback_used:
+                from tools.hosted_tool_search import is_compatibility_error
+
+                if is_compatibility_error(exc):
+                    hosted_tool_search_fallback_used = True
+                    hosted_tool_search_active = False
+                    request_api_kwargs = direct_api_kwargs
+                    logger.warning(
+                        "Hosted tool search rejected by provider; retrying once "
+                        "with complete direct schemas (status=400, model=%s).",
+                        api_kwargs.get("model", "unknown"),
+                    )
+                    # Compatibility fallback is not a transport retry and must
+                    # not consume the one reconnect attempt.
+                    continue
+            if isinstance(
+                exc,
+                (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError),
+            ) and transport_attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
-                    attempt + 1, max_stream_retries + 1,
+                    transport_attempt + 1, max_stream_retries + 1,
                     agent._client_log_context(), exc,
                 )
+                transport_attempt += 1
                 continue
             raise
 
@@ -1272,13 +1361,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-                if attempt < max_stream_retries:
+                if transport_attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
                         "(attempt %s/%s); retrying. %s error=%s",
-                        attempt + 1, max_stream_retries + 1,
+                        transport_attempt + 1, max_stream_retries + 1,
                         agent._client_log_context(), exc,
                     )
+                    transport_attempt += 1
                     continue
                 raise
 

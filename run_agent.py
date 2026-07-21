@@ -586,6 +586,18 @@ class AIAgent:
             return None
         if self._session_db is not None:
             return self._session_db
+        if not getattr(self, "_session_persist_enabled", True):
+            recall_db = getattr(self, "_session_recall_db", None)
+            if recall_db is not None:
+                return recall_db
+            try:
+                from hermes_state import SessionDB
+
+                self._session_recall_db = SessionDB(read_only=True)
+                return self._session_recall_db
+            except Exception:
+                logger.debug("Read-only SessionDB unavailable for recall", exc_info=True)
+                return None
         try:
             from hermes_state import SessionDB
 
@@ -597,7 +609,9 @@ class AIAgent:
 
     def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
-        if getattr(self, "_persist_disabled", False):
+        if getattr(self, "_persist_disabled", False) or not getattr(
+            self, "_session_persist_enabled", True
+        ):
             return
         if self._session_db_created or not self._session_db:
             return
@@ -1850,7 +1864,9 @@ class AIAgent:
         # update the skill library…") inside the user's real session history,
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
-        if getattr(self, "_persist_disabled", False):
+        if getattr(self, "_persist_disabled", False) or not getattr(
+            self, "_session_persist_enabled", True
+        ):
             return
         if not self._session_db:
             return
@@ -3688,6 +3704,16 @@ class AIAgent:
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
+        except Exception:
+            pass
+
+        # 8. Ephemeral agents may own a separate read-only handle used only by
+        # session_search. Close it without touching the caller-owned main DB.
+        try:
+            recall_db = getattr(self, "_session_recall_db", None)
+            if recall_db is not None:
+                recall_db.close()
+                self._session_recall_db = None
         except Exception:
             pass
 

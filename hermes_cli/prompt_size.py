@@ -98,6 +98,28 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
     tools_json = json.dumps(tools, ensure_ascii=False)
+    per_tool = []
+    for idx, tool in enumerate(tools):
+        item_json = json.dumps(tool, ensure_ascii=False)
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = function.get("name") if isinstance(function, dict) else None
+        # Attribute the list brackets and separators so contributions sum
+        # exactly to tools.json_bytes rather than under-reporting JSON framing.
+        contribution_bytes = _bytes(item_json)
+        if idx == 0:
+            contribution_bytes += 1  # opening '['
+        else:
+            contribution_bytes += 2  # default json.dumps list separator ', '
+        if idx == len(tools) - 1:
+            contribution_bytes += 1  # closing ']'
+        per_tool.append(
+            {
+                "name": str(name or f"tool_{idx}"),
+                "schema_bytes": _bytes(item_json),
+                "json_bytes": contribution_bytes,
+            }
+        )
+    per_tool.sort(key=lambda item: (-item["json_bytes"], item["name"]))
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -112,7 +134,11 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
-        "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+        "tools": {
+            "count": len(tools),
+            "json_bytes": _bytes(tools_json),
+            "per_tool": per_tool,
+        },
         "sections": sections,
     }
 
@@ -143,6 +169,14 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
+    per_tool = tools.get("per_tool") or []
+    if per_tool:
+        lines.append("    largest schemas:")
+        for item in per_tool[:10]:
+            lines.append(
+                f"      {item['name']:<28}: {item['json_bytes']:>8,} B  "
+                f"({_fmt_kb(item['json_bytes'])})"
+            )
     return "\n".join(lines)
 
 

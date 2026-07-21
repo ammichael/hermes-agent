@@ -48,6 +48,25 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _cron_session_persistence_enabled() -> bool:
+    """Whether LLM cron runs should create browsable transcript sessions.
+
+    Cron execution remains fully functional when disabled; only the internal
+    run transcript is omitted from the shared session history. Default True
+    preserves the existing behavior for installations that rely on cron
+    transcripts through ``session_search``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("persist_sessions", True))
+    except Exception as exc:
+        logger.debug("Failed to load cron.persist_sessions; using default: %s", exc)
+        return True
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -2204,6 +2223,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            # Cron scripts may spawn long-lived descendants that operators stop
+            # by process group. Keep that signal from reaching the gateway.
+            popen_kwargs = {"start_new_session": True}
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
         result = subprocess.run(
@@ -2803,8 +2826,16 @@ def run_job(
     # the whole gateway process is restarted, silently skipping every
     # scheduled fire in between with "already running — skipping".
     _session_db = None
+    _persist_cron_session = _cron_session_persistence_enabled()
     try:
-        from hermes_state import SessionDB
+        if _persist_cron_session:
+            from hermes_state import SessionDB
+        else:
+            SessionDB = None
+            logger.debug(
+                "Job '%s': cron transcript persistence disabled; run will not appear in session history",
+                job.get("id", "?"),
+            )
 
         # Resolve timeout: env override → config.yaml → default 10s.
         # Mirrors the script_timeout_seconds resolution pattern.
@@ -2834,7 +2865,9 @@ def run_job(
         if _session_db_timeout is None:
             _session_db_timeout = 10.0
 
-        if _session_db_timeout > 0:
+        if SessionDB is None:
+            _session_db = None
+        elif _session_db_timeout > 0:
             _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
                 _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
@@ -3369,6 +3402,11 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if not _persist_cron_session:
+            # Keep tools and delivery live while making this execution
+            # ephemeral. session_search can still open a separate read-only DB.
+            setattr(agent, "_session_persist_enabled", False)
+            setattr(agent, "_session_json_enabled", False)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

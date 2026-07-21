@@ -5372,6 +5372,39 @@ def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     return max(existing, key=lambda p: p.stat().st_mtime)
 
 
+def _launch_packaged_desktop_detached(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+) -> int:
+    """Launch the packaged GUI without tying its lifetime/logs to the CLI TTY.
+
+    Electron already writes its bounded diagnostic log inside the Desktop app.
+    Inheriting the terminal here only duplicates that stream, keeps
+    ``hermes desktop`` blocked until the window closes, and leaves a wall of
+    Chromium diagnostics in the operator's shell.
+    """
+    kwargs = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(command, **kwargs)
+    return process.pid
+
+
 def _electron_download_cache_dirs() -> list[Path]:
     """Return the per-user Electron download cache directories for this OS.
 
@@ -6056,8 +6089,16 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
-    launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
-    sys.exit(launch_result.returncode)
+    try:
+        pid = _launch_packaged_desktop_detached(
+            launch_command,
+            cwd=desktop_dir,
+            env=env,
+        )
+    except OSError as exc:
+        print(f"✗ Failed to launch Hermes Desktop: {exc}")
+        sys.exit(1)
+    print(f"✓ Hermes Desktop launched in background (PID {pid})")
 
 
 def _find_stale_dashboard_pids(

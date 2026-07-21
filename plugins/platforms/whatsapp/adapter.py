@@ -1182,8 +1182,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             file_name or os.path.basename(file_path),
         )
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Send typing indicator via bridge."""
+    async def _send_typing_state(self, chat_id: str, state: str) -> None:
+        """Send a WhatsApp presence state through the local bridge."""
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1197,12 +1197,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # socket in CLOSE_WAIT. See #18451.
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/typing",
-                json={"chatId": to_whatsapp_jid(chat_id)},
+                json={"chatId": to_whatsapp_jid(chat_id), "state": state},
                 timeout=aiohttp.ClientTimeout(total=5)
             ):
                 pass
         except Exception:
             pass  # Ignore typing indicator failures
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Start the WhatsApp typing indicator via bridge."""
+        await self._send_typing_state(chat_id, "composing")
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Stop the WhatsApp typing indicator immediately after a turn."""
+        await self._send_typing_state(chat_id, "paused")
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""

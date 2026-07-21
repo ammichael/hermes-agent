@@ -1357,6 +1357,11 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
+    # Independent from _persist_disabled: an ephemeral runtime may still read
+    # prior sessions through session_search while refusing to create/update its
+    # own transcript. Cron uses this to stay out of user-facing history.
+    agent._session_persist_enabled = True
+    agent._session_recall_db = None
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

@@ -182,3 +182,49 @@ class TestPersistDisabledHardStop:
                 assert db.get_messages("s-review") == []
             finally:
                 db.close()
+
+
+class TestEphemeralSessionPersistence:
+    def test_ephemeral_agent_keeps_read_only_recall_without_creating_own_session(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.db"
+            seed_db = SessionDB(db_path=db_path)
+            seed_db.create_session(
+                session_id="existing-session",
+                source="cli",
+                model="test/model",
+            )
+            seed_db.close()
+            recall_db = SessionDB(db_path=db_path, read_only=True)
+
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+                 patch("hermes_state.SessionDB", return_value=recall_db):
+                from run_agent import AIAgent
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    quiet_mode=True,
+                    session_id="ephemeral-cron-session",
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+                setattr(agent, "_session_persist_enabled", False)
+                setattr(agent, "_session_json_enabled", False)
+
+                agent._ensure_db_session()
+                opened_recall_db = agent._get_session_db_for_recall()
+
+                assert agent._session_db is None
+                assert opened_recall_db is not None
+                assert opened_recall_db is recall_db
+                assert opened_recall_db.get_session("existing-session") is not None
+                assert opened_recall_db.get_session("ephemeral-cron-session") is None
+                agent.close()
+                assert agent._session_recall_db is None

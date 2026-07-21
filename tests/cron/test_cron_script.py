@@ -276,6 +276,19 @@ class TestRunJobScript:
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
+    def test_script_runs_in_process_group_separate_from_gateway(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        parent_pgid = os.getpgid(0)
+        script = cron_env / "scripts" / "process_group.py"
+        script.write_text("import os\nprint(os.getpgid(0))\n")
+
+        success, output = _run_job_script("process_group.py")
+
+        assert success is True
+        assert int(output) != parent_pgid
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 
@@ -286,6 +299,7 @@ class TestRunJobScript:
         assert success is True
         assert output == ""
 
+    @pytest.mark.live_system_guard_bypass
     def test_script_timeout(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script

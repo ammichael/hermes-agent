@@ -1188,11 +1188,16 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
 
+        # Global reasoning effort. Per-model overrides below take precedence.
+        # Keep this in the schema because every runtime surface consumes it.
+        "reasoning_effort": "medium",
+
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
         # matches a key in this dict.
-        # Edit directly in config.yaml (no CLI support due to dots in keys).
+        # Set the whole mapping through the CLI when model IDs contain dots:
+        # hermes config set agent.reasoning_overrides '{"gpt-5.6":"low"}'
         "reasoning_overrides": {},
     },
 
@@ -2842,6 +2847,10 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        # LLM cron runs are persisted as normal sessions by default for
+        # backwards compatibility. Set false to keep internal automation runs
+        # out of Desktop/CLI/Companion history while preserving delivery.
+        "persist_sessions": True,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
@@ -2931,6 +2940,16 @@ DEFAULT_CONFIG = {
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
+        # OpenAI Responses hosted search for *all* function schemas.  Unlike
+        # the client bridge below, the provider loads and calls a deferred
+        # function inside the same response, so core tools remain available
+        # without adding extra Hermes turns.  Off by default; the runtime also
+        # enforces an explicit provider/model/backend allowlist.
+        "hosted_tool_search": {
+            "enabled": False,
+            # OpenAI recommends fewer than ten functions per namespace.
+            "max_tools_per_namespace": 8,
+        },
         "tool_search": {
             # "auto" (default) — activate only when deferrable tool schemas
             #   exceed ``threshold_pct`` of the active model's context length,
@@ -8723,7 +8742,8 @@ def set_config_value(key: str, value: str, force: bool = False):
 
     Args:
         key: Dotted config path (e.g. ``terminal.backend``).
-        value: String value (auto-coerced to bool/int/float when matching).
+        value: String value (auto-coerced to bool/int/float or a JSON/YAML
+            mapping/list when structured syntax is supplied).
         force: When True, skip the unknown-key warning — useful for scripted
             writes of keys the running version doesn't recognize yet. The CLI
             exposes this via ``hermes config set --force``.
@@ -8788,8 +8808,27 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
+    default_value = _default_value_for_key(key)
+    stripped_value = value.strip()
+    if not isinstance(default_value, str):
+        # Accept structured values so open mappings can be configured without
+        # navigating through ambiguous dotted keys. This is especially
+        # important for model IDs such as ``gpt-5.6-sol`` under
+        # ``agent.reasoning_overrides``. Previously the JSON object was saved
+        # as a scalar string, and a follow-up dotted-path write split the model
+        # ID into nested YAML keys.
+        if (
+            len(stripped_value) >= 2
+            and stripped_value[0] in "[{"
+            and stripped_value[-1] in "]}"
+        ):
+            try:
+                structured_value = yaml.safe_load(stripped_value)
+            except yaml.YAMLError as exc:
+                raise ValueError(f"Invalid structured value for {key}") from exc
+            if isinstance(structured_value, (dict, list)):
+                coerced_value = structured_value
+        elif value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
             coerced_value = False
