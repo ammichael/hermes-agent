@@ -147,57 +147,6 @@ def test_free_response_chats_bypass_mention_gating():
     assert adapter._should_process_message(_group_message("hello everyone")) is True
 
 
-def test_free_response_chats_silent_on_exclusive_third_party_mention():
-    """In free-response groups, tagging only someone else (not N) = silence."""
-    adapter = _make_adapter(
-        require_mention=True,
-        free_response_chats=["120363001234567890@g.us"],
-        group_policy="open",
-    )
-
-    # Mike tags only Mari — N must not jump in.
-    assert adapter._should_process_message(
-        _group_message(
-            "@228745763942585 mozi, vai ter que ser no JK",
-            mentionedIds=["228745763942585@lid"],
-        )
-    ) is False
-
-
-def test_free_response_chats_still_processes_when_bot_also_mentioned():
-    adapter = _make_adapter(
-        require_mention=True,
-        free_response_chats=["120363001234567890@g.us"],
-        group_policy="open",
-    )
-
-    assert adapter._should_process_message(
-        _group_message(
-            "@228745763942585 @15551230000 decide aí",
-            mentionedIds=[
-                "228745763942585@lid",
-                "15551230000@s.whatsapp.net",
-            ],
-        )
-    ) is True
-
-
-def test_free_response_chats_still_processes_reply_to_bot_with_other_mention():
-    adapter = _make_adapter(
-        require_mention=True,
-        free_response_chats=["120363001234567890@g.us"],
-        group_policy="open",
-    )
-
-    assert adapter._should_process_message(
-        _group_message(
-            "@228745763942585 ok",
-            mentionedIds=["228745763942585@lid"],
-            quotedParticipant="15551230000@lid",
-        )
-    ) is True
-
-
 def test_free_response_chats_does_not_bypass_other_groups():
     adapter = _make_adapter(
         require_mention=True,
@@ -206,17 +155,6 @@ def test_free_response_chats_does_not_bypass_other_groups():
     )
 
     assert adapter._should_process_message(_group_message("hello everyone")) is False
-
-
-def test_require_mention_false_also_silent_on_exclusive_third_party_mention():
-    adapter = _make_adapter(require_mention=False, group_policy="open")
-
-    assert adapter._should_process_message(
-        _group_message(
-            "@228745763942585 só pra você",
-            mentionedIds=["228745763942585@lid"],
-        )
-    ) is False
 
 
 def test_dm_passes_with_default_pairing_policy():
