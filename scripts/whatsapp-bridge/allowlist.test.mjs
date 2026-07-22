@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
 import {
   expandWhatsAppIdentifiers,
@@ -33,6 +33,9 @@ test('expandWhatsAppIdentifiers resolves phone and lid aliases from session file
 
 test('matchesAllowedUser accepts mapped lid sender when allowlist only contains phone number', () => {
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+  const hermesHome = mkdtempSync(path.join(os.tmpdir(), 'hermes-home-allow-'));
+  const prevHome = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = hermesHome;
 
   try {
     writeFileSync(path.join(sessionDir, 'lid-mapping-19175395595.json'), JSON.stringify('267383306489914'));
@@ -42,19 +45,28 @@ test('matchesAllowedUser accepts mapped lid sender when allowlist only contains 
     assert.equal(matchesAllowedUser('267383306489914@lid', allowedUsers, sessionDir), true);
     assert.equal(matchesAllowedUser('188012763865257@lid', allowedUsers, sessionDir), false);
   } finally {
+    if (prevHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHome;
     rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(hermesHome, { recursive: true, force: true });
   }
 });
 
 test('matchesAllowedUser treats * as allow-all wildcard', () => {
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+  const hermesHome = mkdtempSync(path.join(os.tmpdir(), 'hermes-home-allow-'));
+  const prevHome = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = hermesHome;
 
   try {
     const allowedUsers = parseAllowedUsers('*');
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', allowedUsers, sessionDir), true);
     assert.equal(matchesAllowedUser('267383306489914@lid', allowedUsers, sessionDir), true);
   } finally {
+    if (prevHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHome;
     rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(hermesHome, { recursive: true, force: true });
   }
 });
 
@@ -64,8 +76,13 @@ test('matchesAllowedUser rejects everyone when allowlist is empty (#8389)', () =
   // pairing-code reply. Secure default is now "reject unless explicitly
   // configured"; operators who want an open bot must set `*`.
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+  const hermesHome = mkdtempSync(path.join(os.tmpdir(), 'hermes-home-allow-'));
+  const prevHome = process.env.HERMES_HOME;
 
   try {
+    // Isolate from any real temp-allow grants on the machine.
+    process.env.HERMES_HOME = hermesHome;
+
     const empty = parseAllowedUsers('');
     assert.equal(empty.size, 0);
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', empty, sessionDir), false);
@@ -75,6 +92,45 @@ test('matchesAllowedUser rejects everyone when allowlist is empty (#8389)', () =
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', null, sessionDir), false);
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', undefined, sessionDir), false);
   } finally {
+    if (prevHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHome;
     rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test('matchesAllowedUser admits temporary follow-up grants from state file', () => {
+  const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+  const hermesHome = mkdtempSync(path.join(os.tmpdir(), 'hermes-home-allow-'));
+  const prevHome = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = hermesHome;
+
+  try {
+    const stateDir = path.join(hermesHome, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    writeFileSync(
+      path.join(stateDir, 'whatsapp-bridge-temp-allow.json'),
+      JSON.stringify({
+        grants: [
+          {
+            name: 'Renan',
+            topic: 'BuildersID',
+            ids: ['5519982339900', '233779398463494'],
+            expires_at: expires,
+          },
+        ],
+      }),
+    );
+
+    const empty = parseAllowedUsers('');
+    assert.equal(matchesAllowedUser('5519982339900@s.whatsapp.net', empty, sessionDir), true);
+    assert.equal(matchesAllowedUser('233779398463494@lid', empty, sessionDir), true);
+    assert.equal(matchesAllowedUser('5519999999999@s.whatsapp.net', empty, sessionDir), false);
+  } finally {
+    if (prevHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHome;
+    rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(hermesHome, { recursive: true, force: true });
   }
 });
