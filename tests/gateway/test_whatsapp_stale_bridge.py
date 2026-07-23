@@ -53,6 +53,10 @@ def _make_adapter(bridge_script: str = "/tmp/test-bridge.js",
     adapter._bridge_log = None
     adapter._bridge_process = None
     adapter._reply_prefix = None
+    adapter._whatsapp_mode = "self-chat"
+    adapter._dm_policy = "pairing"
+    adapter._allow_from = set()
+    adapter._group_allow_from = set()
     adapter._running = False
     adapter._message_handler = None
     adapter._fatal_error_code = None
@@ -140,6 +144,37 @@ class TestFileContentHash:
 
 
 class TestStaleBridgeHandshake:
+    @pytest.mark.asyncio
+    async def test_spawns_configured_bot_mode_with_dm_allowlist(self, tmp_path):
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter._whatsapp_mode = "bot"
+        adapter._dm_policy = "allowlist"
+        adapter._allow_from = {"5511999710611", "226529543999522"}
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            result = await adapter.connect()
+
+        assert result is False
+        argv = mock_popen.call_args.args[0]
+        env = mock_popen.call_args.kwargs["env"]
+        assert argv[argv.index("--mode") + 1] == "bot"
+        assert env["WHATSAPP_DM_POLICY"] == "allowlist"
+        assert env["WHATSAPP_ALLOWED_USERS"] == "226529543999522,5511999710611"
+
     @pytest.mark.asyncio
     async def test_reuses_bridge_when_hash_matches(self, tmp_path):
         from plugins.platforms.whatsapp.adapter import _file_content_hash

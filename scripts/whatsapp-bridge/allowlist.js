@@ -174,32 +174,37 @@ export function loadTemporaryAllowedIds(nowMs = Date.now(), options = {}) {
   return ids;
 }
 
-export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
-  // Empty allowlist = NO ONE allowed (secure default, #8389).  Operators
-  // who want an open bot must set ``WHATSAPP_ALLOWED_USERS=*`` explicitly.
-  // Previous behaviour (empty → return true) let any stranger DM the
-  // bridge and trigger a Python-side pairing-code reply.
-  const tempIds = loadTemporaryAllowedIds();
+export function matchesConfiguredAllowedUser(senderId, allowedUsers, sessionDir) {
   const hasStatic = allowedUsers && allowedUsers.size > 0;
-  const hasTemp = tempIds && tempIds.size > 0;
-  if (!hasStatic && !hasTemp) {
-    return false;
-  }
-
-  // "*" means allow everyone (consistent with SIGNAL_GROUP_ALLOWED_USERS)
-  if (hasStatic && allowedUsers.has('*')) {
-    return true;
-  }
+  if (!hasStatic) return false;
+  if (allowedUsers.has('*')) return true;
 
   const aliases = expandWhatsAppIdentifiers(senderId, sessionDir);
   for (const alias of aliases) {
-    if (hasStatic && allowedUsers.has(alias)) {
-      return true;
-    }
-    if (hasTemp && tempIds.has(alias)) {
-      return true;
-    }
+    if (allowedUsers.has(alias)) return true;
+  }
+  return false;
+}
+
+export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
+  // Empty allowlist = NO ONE allowed (secure default, #8389). Operators who
+  // want an open bot must set ``WHATSAPP_ALLOWED_USERS=*`` explicitly.
+  if (matchesConfiguredAllowedUser(senderId, allowedUsers, sessionDir)) {
+    return true;
   }
 
-  return false;
+  const tempIds = loadTemporaryAllowedIds();
+  if (!tempIds || tempIds.size === 0) return false;
+  const aliases = expandWhatsAppIdentifiers(senderId, sessionDir);
+  return [...aliases].some((alias) => tempIds.has(alias));
+}
+
+/**
+ * Self-chat bridges reject non-``fromMe`` DMs. An explicitly configured
+ * group is the narrow exception: it still reaches the gateway's group and
+ * mention gates, while temporary person-level follow-up grants cannot widen
+ * group ingress.
+ */
+export function allowsSelfChatInboundGroup(chatId, isGroup, allowedGroups, sessionDir) {
+  return Boolean(isGroup) && matchesConfiguredAllowedUser(chatId, allowedGroups, sessionDir);
 }

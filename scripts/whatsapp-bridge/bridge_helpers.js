@@ -170,6 +170,21 @@ export function buildTextSendPayload(text, { replyTo, messageStore } = {}) {
   return { content, options };
 }
 
+export function buildReactionPayload({ chatId, messageId, reaction, participant } = {}) {
+  const key = {
+    remoteJid: String(chatId || ''),
+    id: String(messageId || ''),
+    fromMe: true,
+  };
+  if (participant) key.participant = String(participant);
+  return {
+    react: {
+      text: String(reaction || ''),
+      key,
+    },
+  };
+}
+
 export function buildLocationPayload({ latitude, longitude, name, address } = {}) {
   const lat = Number(latitude);
   const lon = Number(longitude);

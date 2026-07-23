@@ -406,6 +406,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._whatsapp_mode = str(
+            config.extra.get("mode") or os.getenv("WHATSAPP_MODE", "self-chat")
+        ).strip().lower()
+        if self._whatsapp_mode not in {"bot", "self-chat"}:
+            raise ValueError(
+                "WhatsApp mode must be 'bot' or 'self-chat', "
+                f"got {self._whatsapp_mode!r}"
+            )
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
@@ -614,7 +622,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
             # messages are preserved for troubleshooting.
-            whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+            whatsapp_mode = getattr(
+                self, "_whatsapp_mode", os.getenv("WHATSAPP_MODE", "self-chat")
+            )
             self._bridge_log = self._session_path.parent / "bridge.log"
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
@@ -626,6 +636,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            bridge_env["WHATSAPP_DM_POLICY"] = getattr(
+                self, "_dm_policy", os.getenv("WHATSAPP_DM_POLICY", "pairing")
+            )
+            allow_from = getattr(self, "_allow_from", set())
+            if allow_from:
+                bridge_env["WHATSAPP_ALLOWED_USERS"] = ",".join(sorted(allow_from))
+            # The bridge has an early self-chat ingress gate, before this
+            # adapter can apply its group policy. Carry the config-backed
+            # allowlist into that child explicitly: the platform config is not
+            # otherwise exported into os.environ by the gateway runtime.
+            group_allow_from = getattr(self, "_group_allow_from", set())
+            if group_allow_from:
+                bridge_env["WHATSAPP_GROUP_ALLOWED_USERS"] = ",".join(
+                    sorted(group_allow_from)
+                )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges

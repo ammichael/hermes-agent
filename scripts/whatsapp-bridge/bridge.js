@@ -8,6 +8,7 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /react          - React to a message { chatId, messageId, reaction, participant? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
@@ -30,11 +31,12 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { allowsSelfChatInboundGroup, matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
+  buildReactionPayload,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -104,6 +106,7 @@ const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const ALLOWED_GROUPS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -618,23 +621,30 @@ async function startSocket() {
       }
 
       // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
+      // Self-chat mode rejects non-self DMs. Explicitly configured groups
+      // are the narrow exception: they still traverse the gateway's group
+      // policy and mention gates, but must reach those controls first.
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
+          if (allowsSelfChatInboundGroup(chatId, isGroup, ALLOWED_GROUPS, SESSION_DIR)) {
+            emitDebugEvent({
+              stage: 'self_chat_allowed_group',
+              chatId: redactWhatsAppId(chatId),
+              senderId: redactWhatsAppId(senderId),
+            });
+          } else {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'self_chat_mode_rejects_non_self',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        if (!isGroup && WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -841,6 +851,31 @@ app.post('/send', async (req, res) => {
       messageId: messageIds[messageIds.length - 1],
       messageIds,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// React to an existing message using the same WhatsApp identity as /send.
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, reaction, participant } = req.body;
+  if (!chatId || !messageId || !reaction) {
+    return res.status(400).json({ error: 'chatId, messageId, and reaction are required' });
+  }
+
+  try {
+    const targetParticipant = participant
+      || (String(chatId).endsWith('@g.us') ? jidNormalizedUser(sock.user?.id || '') : undefined);
+    const sent = await sendWithTimeout(
+      chatId,
+      buildReactionPayload({ chatId, messageId, reaction, participant: targetParticipant }),
+    );
+    trackSentMessageId(sent);
+    res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

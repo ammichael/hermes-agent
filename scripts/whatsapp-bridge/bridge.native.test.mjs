@@ -14,6 +14,7 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
   buildPollPayload,
+  buildReactionPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
@@ -211,6 +212,40 @@ import {
 }
 
 // -- outbound media/poll helpers -----------------------------------------
+{
+  assert.deepEqual(
+    buildReactionPayload({
+      chatId: '15551234567@s.whatsapp.net',
+      messageId: 'message-123',
+      reaction: '✅',
+    }),
+    {
+      react: {
+        text: '✅',
+        key: {
+          remoteJid: '15551234567@s.whatsapp.net',
+          id: 'message-123',
+          fromMe: true,
+        },
+      },
+    },
+  );
+  console.log('  ✓ outbound reaction targets the original sent message');
+}
+
+{
+  assert.deepEqual(
+    buildReactionPayload({
+      chatId: '123@g.us',
+      messageId: 'message-456',
+      reaction: '✅',
+      participant: '15550001111@s.whatsapp.net',
+    }).react.key.participant,
+    '15550001111@s.whatsapp.net',
+  );
+  console.log('  ✓ group reaction preserves the target participant when supplied');
+}
+
 {
   const payload = mediaPayloadForFile({
     buffer: Buffer.from('gif89a'),

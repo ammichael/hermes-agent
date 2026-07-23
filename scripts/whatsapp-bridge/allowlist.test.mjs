@@ -5,6 +5,7 @@ import path from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
 import {
+  allowsSelfChatInboundGroup,
   expandWhatsAppIdentifiers,
   matchesAllowedUser,
   normalizeWhatsAppIdentifier,
@@ -127,6 +128,34 @@ test('matchesAllowedUser admits temporary follow-up grants from state file', () 
     assert.equal(matchesAllowedUser('5519982339900@s.whatsapp.net', empty, sessionDir), true);
     assert.equal(matchesAllowedUser('233779398463494@lid', empty, sessionDir), true);
     assert.equal(matchesAllowedUser('5519999999999@s.whatsapp.net', empty, sessionDir), false);
+  } finally {
+    if (prevHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHome;
+    rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test('self-chat admits only explicitly allowlisted groups', () => {
+  const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-self-chat-'));
+  const hermesHome = mkdtempSync(path.join(os.tmpdir(), 'hermes-home-self-chat-'));
+  const prevHome = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = hermesHome;
+
+  try {
+    const allowedGroups = parseAllowedUsers('120363001234567890@g.us');
+    assert.equal(
+      allowsSelfChatInboundGroup('120363001234567890@g.us', true, allowedGroups, sessionDir),
+      true,
+    );
+    assert.equal(
+      allowsSelfChatInboundGroup('120363009999999999@g.us', true, allowedGroups, sessionDir),
+      false,
+    );
+    assert.equal(
+      allowsSelfChatInboundGroup('5511999999999@s.whatsapp.net', false, allowedGroups, sessionDir),
+      false,
+    );
   } finally {
     if (prevHome === undefined) delete process.env.HERMES_HOME;
     else process.env.HERMES_HOME = prevHome;
