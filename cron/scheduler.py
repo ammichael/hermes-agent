@@ -3181,6 +3181,33 @@ def run_job(
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+        # Cron jobs may intentionally pin a semantic model role (for example
+        # ``role:critical``) rather than a provider-native model identifier.
+        # Resolve it here, after config is loaded and before provider routing,
+        # so aliases never reach provider APIs as literal model names.
+        if isinstance(model, str) and model.startswith("role:"):
+            role_name = model.removeprefix("role:").strip()
+            configured_provider = (
+                str(_model_cfg.get("provider") or "").strip()
+                if isinstance(_model_cfg, dict)
+                else ""
+            )
+            role_provider = str(job.get("provider") or configured_provider).strip()
+            model_cfg_for_roles = _model_cfg if isinstance(_model_cfg, dict) else {}
+            role_models = model_cfg_for_roles.get("roles")
+            provider_roles = role_models.get(role_provider) if isinstance(role_models, dict) else None
+            resolved_role_model = (
+                provider_roles.get(role_name)
+                if isinstance(provider_roles, dict)
+                else None
+            )
+            if not isinstance(resolved_role_model, str) or not resolved_role_model.strip():
+                raise RuntimeError(
+                    f"Cron job '{job_name}' model role '{model}' has no mapping "
+                    f"for provider '{role_provider or '<unset>'}' in config.yaml model.roles."
+                )
+            model = resolved_role_model.strip()
+
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):

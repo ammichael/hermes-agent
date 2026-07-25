@@ -2330,6 +2330,43 @@ class TestRunJobConfigEnvVarExpansion:
             "config.yaml ${VAR} was not expanded in the cron execution path."
         )
 
+    def test_explicit_role_alias_resolves_for_the_pinned_provider(self, tmp_path):
+        """A cron model role must resolve before it reaches a provider API."""
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  roles:\n"
+            "    openai-codex:\n"
+            "      critical: gpt-5.6-terra\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "role-job",
+            "name": "role test",
+            "prompt": "hi",
+            "provider": "openai-codex",
+            "model": "role:critical",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=self._RUNTIME) as resolve_runtime, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert resolve_runtime.call_args.kwargs["target_model"] == "gpt-5.6-terra"
+        assert mock_agent_cls.call_args.kwargs["model"] == "gpt-5.6-terra"
+
     def test_legacy_agent_prefill_messages_file_is_loaded(self, tmp_path, monkeypatch):
         """Cron accepts the legacy agent.prefill_messages_file fallback."""
         prefill = [{"role": "system", "content": "legacy cron prefill"}]
