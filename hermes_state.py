@@ -210,7 +210,16 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
+
+_GATEWAY_EVENT_CONDITIONS_LOCK = threading.Lock()
+_GATEWAY_EVENT_CONDITIONS: Dict[str, threading.Condition] = {}
+
+
+def _gateway_event_condition(db_path: Path) -> threading.Condition:
+    key = str(db_path.expanduser().resolve())
+    with _GATEWAY_EVENT_CONDITIONS_LOCK:
+        return _GATEWAY_EVENT_CONDITIONS.setdefault(key, threading.Condition())
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1131,6 +1140,22 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_read_cursors (
+    reader_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (reader_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id INTEGER,
+    timestamp REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -1199,11 +1224,39 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_gateway_events_session ON gateway_events(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+
+CREATE TRIGGER IF NOT EXISTS gateway_event_message_created
+AFTER INSERT ON messages BEGIN
+    INSERT INTO gateway_events(type, session_id, message_id, timestamp)
+    VALUES ('message.created', new.session_id, new.id, new.timestamp);
+END;
+
+CREATE TRIGGER IF NOT EXISTS gateway_event_session_archived
+AFTER UPDATE OF archived ON sessions
+WHEN old.archived IS NOT new.archived BEGIN
+    INSERT INTO gateway_events(type, session_id, timestamp)
+    VALUES (
+        'session.updated',
+        new.id,
+        (julianday('now') - 2440587.5) * 86400.0
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS gateway_event_session_deleted
+AFTER DELETE ON sessions BEGIN
+    INSERT INTO gateway_events(type, session_id, timestamp)
+    VALUES (
+        'session.deleted',
+        old.id,
+        (julianday('now') - 2440587.5) * 86400.0
+    );
+END;
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1611,6 +1664,7 @@ class SessionDB:
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
+        self._gateway_event_condition = _gateway_event_condition(self.db_path)
 
         self._lock = threading.Lock()
         self._write_count = 0
@@ -2087,6 +2141,8 @@ class SessionDB:
                             pass
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
+                with self._gateway_event_condition:
+                    self._gateway_event_condition.notify_all()
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -4889,6 +4945,121 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_session_read_states(
+        self,
+        reader_id: Optional[str],
+        session_ids: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return authoritative message/read counters for exact session IDs."""
+        session_ids = list(dict.fromkeys(sid for sid in session_ids if sid))
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT s.id AS session_id,
+                       MAX(CASE WHEN m.active = 1 THEN m.id END) AS last_message_id,
+                       rc.message_id AS read_through_message_id,
+                       COUNT(CASE
+                           WHEN m.active = 1
+                            AND m.id > COALESCE(rc.message_id, 0)
+                           THEN 1
+                       END) AS unread_count
+                FROM sessions s
+                LEFT JOIN session_read_cursors rc
+                  ON rc.session_id = s.id AND rc.reader_id = ?
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.id IN ({placeholders})
+                GROUP BY s.id, rc.message_id
+                """,
+                [reader_id, *session_ids],
+            ).fetchall()
+        return {
+            row["session_id"]: {
+                "last_message_id": row["last_message_id"],
+                "read_through_message_id": row["read_through_message_id"],
+                "unread_count": int(row["unread_count"] or 0),
+            }
+            for row in rows
+        }
+
+    def advance_session_read_cursor(
+        self,
+        reader_id: str,
+        session_id: str,
+        message_id: int,
+    ) -> Dict[str, Any]:
+        """Advance one reader/session cursor through an exact persisted message."""
+        now = time.time()
+
+        def _do(conn):
+            message = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE id = ? AND session_id = ? AND active = 1",
+                (message_id, session_id),
+            ).fetchone()
+            if message is None:
+                raise ValueError(
+                    f"Message {message_id} is not active in session {session_id}"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_read_cursors(
+                    reader_id, session_id, message_id, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(reader_id, session_id) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    updated_at = excluded.updated_at
+                WHERE excluded.message_id > session_read_cursors.message_id
+                """,
+                (reader_id, session_id, message_id, now),
+            )
+            row = conn.execute(
+                "SELECT message_id, updated_at FROM session_read_cursors "
+                "WHERE reader_id = ? AND session_id = ?",
+                (reader_id, session_id),
+            ).fetchone()
+            return {
+                "reader_id": reader_id,
+                "session_id": session_id,
+                "read_through_message_id": row["message_id"],
+                "updated_at": row["updated_at"],
+            }
+
+        return self._execute_write(_do)
+
+    def list_gateway_events(
+        self,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read the durable gateway event log after an exact event cursor."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, type, session_id, message_id, timestamp "
+                "FROM gateway_events WHERE id > ? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            ).fetchall()
+        return [
+            {key: row[key] for key in row.keys() if row[key] is not None}
+            for row in rows
+        ]
+
+    def wait_for_gateway_events(
+        self,
+        after_id: int,
+        timeout: float,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Wait for committed events without inferring changes from session rows."""
+        with self._gateway_event_condition:
+            events = self.list_gateway_events(after_id, limit)
+            if events:
+                return events
+            self._gateway_event_condition.wait(timeout)
+            return self.list_gateway_events(after_id, limit)
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

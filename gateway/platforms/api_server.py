@@ -12,6 +12,8 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- POST /api/sessions/{session_id}/read — advance a durable reader cursor
+- GET  /api/events                 — replayable persisted session event stream
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -125,6 +127,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+GATEWAY_EVENTS_HEARTBEAT_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1769,6 +1772,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("POST", "/api/sessions/{session_id}/read", self._handle_mark_session_read),
+            ("GET", "/api/events", self._handle_events),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -2822,6 +2827,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "session_archive": True,
+                "session_read_cursors": True,
+                "session_events_sse": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2852,6 +2860,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_read": {"method": "POST", "path": "/api/sessions/{session_id}/read"},
+                "session_events": {"method": "GET", "path": "/api/events"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -2969,9 +2979,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "archived", "last_message_id", "read_through_message_id",
+            "unread_count", "_lineage_root_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
+        if "archived" in payload:
+            payload["archived"] = bool(payload["archived"])
         # Avoid exposing full system prompts/model_config through the client API;
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
@@ -2986,6 +2999,41 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_content",
         )
         return {key: message.get(key) for key in safe_keys if key in message}
+
+    @staticmethod
+    def _parse_reader_id(value: Any, *, required: bool = False) -> tuple[Optional[str], Optional[str]]:
+        if value is None and not required:
+            return None, None
+        if not isinstance(value, str):
+            return None, "reader_id must be a string"
+        reader_id = value.strip()
+        if (
+            not reader_id
+            or len(reader_id) > 128
+            or not reader_id.isprintable()
+        ):
+            return None, "reader_id must be 1-128 printable characters"
+        return reader_id, None
+
+    async def _add_session_read_state(
+        self,
+        db: Any,
+        sessions: List[Dict[str, Any]],
+        reader_id: Optional[str],
+    ) -> None:
+        if not sessions:
+            return
+        states = await asyncio.to_thread(
+            db.get_session_read_states,
+            reader_id,
+            [session["id"] for session in sessions],
+        )
+        for session in sessions:
+            session.update(states.get(session["id"], {
+                "last_message_id": None,
+                "read_through_message_id": None,
+                "unread_count": 0,
+            }))
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -3033,13 +3081,24 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        include_archived = _coerce_request_bool(request.query.get("include_archived"), default=False)
+        archived_only = _coerce_request_bool(request.query.get("archived_only"), default=False)
+        reader_id, reader_error = self._parse_reader_id(request.query.get("reader_id"))
+        if reader_error:
+            return web.json_response(
+                _openai_error(reader_error, code="invalid_reader_id"),
+                status=400,
+            )
         sessions = await asyncio.to_thread(db.list_sessions_rich,
             source=source,
             limit=limit,
             offset=offset,
             include_children=include_children,
             order_by_last_active=True,
+            include_archived=include_archived,
+            archived_only=archived_only,
         )
+        await self._add_session_read_state(db, sessions, reader_id)
         return web.json_response({
             "object": "list",
             "data": [self._session_response(s) for s in sessions],
@@ -3167,6 +3226,14 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
+        reader_id, reader_error = self._parse_reader_id(request.query.get("reader_id"))
+        if reader_error:
+            return web.json_response(
+                _openai_error(reader_error, code="invalid_reader_id"),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        await self._add_session_read_state(db, [session], reader_id)
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
@@ -3181,10 +3248,15 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        allowed = {"title", "end_reason", "archived"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+        if "archived" in body and not isinstance(body["archived"], bool):
+            return web.json_response(
+                _openai_error("archived must be a boolean", code="invalid_archived"),
+                status=400,
+            )
 
         db = await self._ensure_session_db_async()
         if "title" in body:
@@ -3194,6 +3266,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+        if "archived" in body:
+            await asyncio.to_thread(
+                db.set_session_archived,
+                session_id,
+                body["archived"],
+            )
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
@@ -3227,6 +3305,143 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
         })
+
+    async def _handle_mark_session_read(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/read — monotonically advance a reader."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        unknown = sorted(set(body) - {"reader_id", "message_id"})
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported read fields: {', '.join(unknown)}",
+                    code="unsupported_read_field",
+                ),
+                status=400,
+            )
+        reader_id, reader_error = self._parse_reader_id(
+            body.get("reader_id"),
+            required=True,
+        )
+        if reader_error:
+            return web.json_response(
+                _openai_error(reader_error, code="invalid_reader_id"),
+                status=400,
+            )
+        message_id = body.get("message_id")
+        if (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+            or message_id > 9_223_372_036_854_775_807
+        ):
+            return web.json_response(
+                _openai_error(
+                    "message_id must be a positive integer",
+                    code="invalid_read_message",
+                ),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        try:
+            cursor = await asyncio.to_thread(
+                db.advance_session_read_cursor,
+                reader_id,
+                session_id,
+                message_id,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_read_message"),
+                status=400,
+            )
+        state = (
+            await asyncio.to_thread(
+                db.get_session_read_states,
+                reader_id,
+                [session_id],
+            )
+        )[session_id]
+        return web.json_response({
+            "object": "hermes.session.read",
+            **cursor,
+            **state,
+        })
+
+    async def _handle_events(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/events — replay and follow the durable gateway event log."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        raw_after = request.query.get("after")
+        if raw_after is None:
+            raw_after = request.headers.get("Last-Event-ID", "0")
+        try:
+            after_id = int(raw_after)
+        except (TypeError, ValueError):
+            after_id = -1
+        if after_id < 0 or after_id > 9_223_372_036_854_775_807:
+            return web.json_response(
+                _openai_error(
+                    "after and Last-Event-ID must be non-negative integers",
+                    code="invalid_event_cursor",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            headers.update(cors)
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+
+        try:
+            while True:
+                events = await asyncio.to_thread(
+                    db.wait_for_gateway_events,
+                    after_id,
+                    GATEWAY_EVENTS_HEARTBEAT_SECONDS,
+                )
+                if not events:
+                    await response.write(b": heartbeat\n\n")
+                    continue
+                for event in events:
+                    payload = json.dumps(event, separators=(",", ":"))
+                    await response.write(
+                        f"id: {event['id']}\n"
+                        f"event: {event['type']}\n"
+                        f"data: {payload}\n\n".encode()
+                    )
+                    after_id = event["id"]
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logger.debug("[api_server] gateway event stream closed: %s", exc)
+        return response
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""

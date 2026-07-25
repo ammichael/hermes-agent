@@ -1,5 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -45,10 +47,20 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_post("/api/sessions/{session_id}/read", adapter._handle_mark_session_read)
+    app.router.add_get("/api/events", adapter._handle_events)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+async def _read_sse_data(response):
+    while True:
+        block = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+        for line in block.decode().splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
 
 
 @pytest.mark.asyncio
@@ -64,6 +76,9 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_archive"] is True
+    assert features["session_read_cursors"] is True
+    assert features["session_events_sse"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -72,6 +87,14 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert data["endpoints"]["session_chat_stream"] == {
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
+    }
+    assert data["endpoints"]["session_read"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/read",
+    }
+    assert data["endpoints"]["session_events"] == {
+        "method": "GET",
+        "path": "/api/events",
     }
 
 
@@ -426,6 +449,200 @@ async def test_session_endpoints_require_auth_when_key_configured(auth_adapter):
         data = await ok.json()
         assert data["object"] == "list"
         assert data["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_read_cursor_is_durable_per_reader_and_monotonic(adapter, session_db):
+    session_db.create_session("session-a", "api_server")
+    first_id = session_db.append_message("session-a", "user", "first")
+    second_id = session_db.append_message("session-a", "assistant", "second")
+    session_db.create_session("session-b", "api_server")
+    foreign_id = session_db.append_message("session-b", "assistant", "foreign")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        initial = await (await cli.get("/api/sessions?reader_id=device-a")).json()
+        session = next(row for row in initial["data"] if row["id"] == "session-a")
+        assert session["last_message_id"] == second_id
+        assert session["read_through_message_id"] is None
+        assert session["unread_count"] == 2
+
+        for message_id in (first_id, second_id, first_id):
+            response = await cli.post(
+                "/api/sessions/session-a/read",
+                json={"reader_id": "device-a", "message_id": message_id},
+            )
+            assert response.status == 200
+
+        marked = await (await cli.get("/api/sessions/session-a?reader_id=device-a")).json()
+        assert marked["session"]["read_through_message_id"] == second_id
+        assert marked["session"]["unread_count"] == 0
+
+        other_reader = await (await cli.get("/api/sessions/session-a?reader_id=device-b")).json()
+        assert other_reader["session"]["read_through_message_id"] is None
+        assert other_reader["session"]["unread_count"] == 2
+
+        wrong_session = await cli.post(
+            "/api/sessions/session-a/read",
+            json={"reader_id": "device-a", "message_id": foreign_id},
+        )
+        assert wrong_session.status == 400
+        assert (await wrong_session.json())["error"]["code"] == "invalid_read_message"
+
+    reopened = SessionDB(session_db.db_path)
+    try:
+        state = reopened.get_session_read_states("device-a", ["session-a"])["session-a"]
+        assert state["read_through_message_id"] == second_id
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_session_archive_is_idempotent_and_catalog_filters_it(auth_adapter, session_db):
+    session_db.create_session("active-session", "api_server")
+    session_db.create_session("archive-session", "api_server")
+    app = _create_session_app(auth_adapter)
+    headers = {"Authorization": "Bearer sk-test"}
+
+    async with TestClient(TestServer(app)) as cli:
+        for _ in range(2):
+            response = await cli.patch(
+                "/api/sessions/archive-session",
+                json={"archived": True},
+                headers=headers,
+            )
+            assert response.status == 200
+            assert (await response.json())["session"]["archived"] is True
+        assert [
+            event["type"] for event in session_db.list_gateway_events()
+        ] == ["session.updated"]
+
+        default_ids = {
+            row["id"]
+            for row in (await (await cli.get("/api/sessions", headers=headers)).json())["data"]
+        }
+        assert default_ids == {"active-session"}
+
+        all_ids = {
+            row["id"]
+            for row in (
+                await (
+                    await cli.get("/api/sessions?include_archived=true", headers=headers)
+                ).json()
+            )["data"]
+        }
+        assert all_ids == {"active-session", "archive-session"}
+
+        archived_ids = {
+            row["id"]
+            for row in (
+                await (
+                    await cli.get("/api/sessions?archived_only=true", headers=headers)
+                ).json()
+            )["data"]
+        }
+        assert archived_ids == {"archive-session"}
+
+
+@pytest.mark.asyncio
+async def test_events_are_transactional_authenticated_and_reconnectable(
+    auth_adapter,
+    session_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.GATEWAY_EVENTS_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    session_db.create_session("event-session", "api_server")
+
+    def _rolled_back_message(conn):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("event-session", "assistant", "rolled back", 123.0),
+        )
+        raise RuntimeError("rollback")
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        session_db._execute_write(_rolled_back_message)
+    assert session_db.list_gateway_events() == []
+
+    first_id = session_db.append_message(
+        "event-session", "user", "first", timestamp=100.0
+    )
+    second_id = session_db.append_message(
+        "event-session", "assistant", "second", timestamp=200.0
+    )
+    session_db.set_session_archived("event-session", True)
+    session_db.delete_session("event-session")
+
+    events = session_db.list_gateway_events()
+    assert [event["type"] for event in events] == [
+        "message.created",
+        "message.created",
+        "session.updated",
+        "session.deleted",
+    ]
+    assert events[0]["message_id"] == first_id
+    assert events[0]["timestamp"] == 100.0
+    assert events[1]["message_id"] == second_id
+    assert all(event["session_id"] == "event-session" for event in events)
+
+    app = _create_session_app(auth_adapter)
+    headers = {"Authorization": "Bearer sk-test"}
+    async with TestClient(TestServer(app)) as cli:
+        unauthorized = await cli.get("/api/events?after=0")
+        assert unauthorized.status == 401
+
+        replay = await cli.get(
+            "/api/events",
+            headers={**headers, "Last-Event-ID": str(events[0]["id"])},
+        )
+        replayed = await _read_sse_data(replay)
+        assert replayed == events[1]
+        replay.close()
+
+        after = await cli.get(
+            f"/api/events?after={events[1]['id']}",
+            headers=headers,
+        )
+        replayed = await _read_sse_data(after)
+        assert replayed == events[2]
+        after.close()
+
+        session_db.create_session("live-session", "api_server")
+        last_event_id = session_db.list_gateway_events()[-1]["id"]
+        live = await cli.get(f"/api/events?after={last_event_id}", headers=headers)
+        writer = SessionDB(session_db.db_path)
+        try:
+            await asyncio.to_thread(
+                writer.append_message,
+                "live-session",
+                "assistant",
+                "live",
+            )
+        finally:
+            writer.close()
+        pushed = await _read_sse_data(live)
+        assert pushed["type"] == "message.created"
+        assert pushed["session_id"] == "live-session"
+        live.close()
+
+        latest_event_id = session_db.list_gateway_events()[-1]["id"]
+        heartbeat = await cli.get(
+            f"/api/events?after={latest_event_id}",
+            headers=headers,
+        )
+        block = await asyncio.wait_for(
+            heartbeat.content.readuntil(b"\n\n"),
+            timeout=1,
+        )
+        assert block == b": heartbeat\n\n"
+        heartbeat.close()
+
+        invalid = await cli.get("/api/events?after=not-an-id", headers=headers)
+        assert invalid.status == 400
+        assert (await invalid.json())["error"]["code"] == "invalid_event_cursor"
 
 
 @pytest.mark.asyncio
