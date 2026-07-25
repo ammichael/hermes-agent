@@ -1773,6 +1773,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/read", self._handle_mark_session_read),
+            ("POST", "/api/sessions/{session_id}/undo", self._handle_session_undo),
             ("GET", "/api/events", self._handle_events),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
@@ -2830,6 +2831,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_archive": True,
                 "session_read_cursors": True,
                 "session_events_sse": True,
+                "session_undo": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2861,6 +2863,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_read": {"method": "POST", "path": "/api/sessions/{session_id}/read"},
+                "session_undo": {"method": "POST", "path": "/api/sessions/{session_id}/undo"},
                 "session_events": {"method": "GET", "path": "/api/events"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
@@ -3304,6 +3307,78 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+        })
+
+    async def _handle_session_undo(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/undo — rewind canonical history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        unknown = sorted(set(body) - {"count"})
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported undo fields: {', '.join(unknown)}",
+                    code="unsupported_undo_field",
+                ),
+                status=400,
+            )
+        count = body.get("count", 1)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            return web.json_response(
+                _openai_error(
+                    "count must be a positive integer",
+                    code="invalid_undo_count",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        recents = await asyncio.to_thread(
+            db.list_recent_user_messages,
+            session_id,
+            max(count, 10),
+        )
+        if not recents:
+            return web.json_response(
+                _openai_error(
+                    "No user messages to undo",
+                    code="nothing_to_undo",
+                ),
+                status=409,
+            )
+        target_index = min(count - 1, len(recents) - 1)
+        try:
+            result = await asyncio.to_thread(
+                db.rewind_to_message,
+                session_id,
+                recents[target_index]["id"],
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="undo_failed"),
+                status=409,
+            )
+        target = result.get("target_message") or {}
+        text = target.get("content") or ""
+        if isinstance(text, list):
+            text = "\n".join(
+                item.get("text", "")
+                for item in text
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return web.json_response({
+            "object": "hermes.session.undo",
+            "session_id": session_id,
+            "turns_undone": target_index + 1,
+            "rewound_count": result.get("rewound_count", 0),
+            "message": text if isinstance(text, str) else "",
         })
 
     async def _handle_mark_session_read(self, request: "web.Request") -> "web.Response":

@@ -48,6 +48,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/read", adapter._handle_mark_session_read)
+    app.router.add_post("/api/sessions/{session_id}/undo", adapter._handle_session_undo)
     app.router.add_get("/api/events", adapter._handle_events)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
@@ -79,6 +80,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_archive"] is True
     assert features["session_read_cursors"] is True
     assert features["session_events_sse"] is True
+    assert features["session_undo"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -95,6 +97,10 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert data["endpoints"]["session_events"] == {
         "method": "GET",
         "path": "/api/events",
+    }
+    assert data["endpoints"]["session_undo"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/undo",
     }
 
 
@@ -213,6 +219,32 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
     assert messages["object"] == "list"
     assert messages["session_id"] == "tip-session"
     assert [m["content"] for m in messages["data"]] == ["after compression"]
+
+
+@pytest.mark.asyncio
+async def test_session_undo_rewinds_canonical_history(adapter, session_db):
+    session_id = session_db.create_session("undo-session", "api_server")
+    session_db.append_message(session_id, "user", "first")
+    session_db.append_message(session_id, "assistant", "one")
+    session_db.append_message(session_id, "user", "rewrite me")
+    session_db.append_message(session_id, "assistant", "two")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{session_id}/undo",
+            json={"count": 1},
+        )
+        payload = await response.json()
+
+    assert response.status == 200
+    assert payload["object"] == "hermes.session.undo"
+    assert payload["message"] == "rewrite me"
+    assert payload["turns_undone"] == 1
+    assert [m["content"] for m in session_db.get_messages(session_id)] == [
+        "first",
+        "one",
+    ]
 
 
 @pytest.mark.asyncio
