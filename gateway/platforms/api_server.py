@@ -3312,24 +3312,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 error or emoji_error or whatsapp_error
             ), status=400)
         db = await self._ensure_session_db_async()
-        try:
-            group = await asyncio.to_thread(
-                db.create_conversation_group,
+        if whatsapp_id:
+            group, created = await asyncio.to_thread(
+                db.upsert_conversation_group,
                 f"grp_{uuid.uuid4().hex}",
                 title,
                 emoji,
                 whatsapp_id,
             )
-        except Exception as exc:
-            if "UNIQUE constraint failed" in str(exc):
-                return web.json_response(_openai_error(
-                    "whatsapp_group_id is already linked"
-                ), status=409)
-            raise
+        else:
+            group = await asyncio.to_thread(
+                db.create_conversation_group,
+                f"grp_{uuid.uuid4().hex}",
+                title,
+                emoji,
+                None,
+            )
+            created = True
         return web.json_response({
             "object": "hermes.conversation_group",
             "group": self._group_response(group),
-        }, status=201)
+        }, status=201 if created else 200)
 
     async def _handle_patch_conversation_group(self, request: "web.Request") -> "web.Response":
         auth_err = self._check_auth(request)

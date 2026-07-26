@@ -5022,6 +5022,49 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def upsert_conversation_group(
+        self,
+        group_id: str,
+        title: str,
+        emoji: Optional[str],
+        whatsapp_group_id: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        """Idempotently create/update the group bound to a real WhatsApp JID."""
+        now = time.time()
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id FROM conversation_groups WHERE whatsapp_group_id = ?",
+                (whatsapp_group_id,),
+            ).fetchone()
+            effective_id = existing["id"] if existing else group_id
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE conversation_groups
+                    SET title = ?, emoji = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (title, emoji, now, effective_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_groups(
+                        id, title, emoji, whatsapp_group_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (effective_id, title, emoji, whatsapp_group_id, now, now),
+                )
+            return effective_id, existing is None
+
+        effective_id, created = self._execute_write(_do)
+        group = next(
+            group for group in self.list_conversation_groups()
+            if group["id"] == effective_id
+        )
+        return group, created
+
     def update_conversation_group(
         self,
         group_id: str,

@@ -83,6 +83,16 @@ async def test_conversation_group_crud_uses_exact_gateway_session_ids(adapter, s
             "session_ids": [],
         }
 
+        upsert_resp = await cli.post("/api/conversation-groups", json={
+            "title": "Casa",
+            "emoji": "💜",
+            "whatsapp_group_id": "120363-real@g.us",
+        })
+        assert upsert_resp.status == 200
+        upserted = await upsert_resp.json()
+        assert upserted["group"]["id"] == group_id
+        assert upserted["group"]["title"] == "Casa"
+
         assign_resp = await cli.post(
             f"/api/conversation-groups/{group_id}/sessions",
             json={"session_ids": ["wa_real_group_123", "api_real_session_456"]},
