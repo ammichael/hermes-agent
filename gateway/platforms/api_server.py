@@ -3048,6 +3048,8 @@ class APIServerAdapter(BasePlatformAdapter):
         db: Any,
         sessions: List[Dict[str, Any]],
     ) -> None:
+        if not hasattr(db, "get_session_groups"):
+            return
         groups = await asyncio.to_thread(
             db.get_session_groups,
             [session["id"] for session in sessions],
