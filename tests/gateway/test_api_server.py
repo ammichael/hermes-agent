@@ -5148,6 +5148,10 @@ class TestSessionDbOffEventLoop:
     in asyncio.to_thread.
     """
 
+    def test_companion_session_sources_remain_canonical(self, auth_adapter):
+        assert auth_adapter._normalize_session_source("companion_ios") == "companion_ios"
+        assert auth_adapter._normalize_session_source("companion_mac") == "companion_mac"
+
     @pytest.mark.asyncio
     async def test_get_existing_session_or_404_offloads(self, auth_adapter):
         import threading
