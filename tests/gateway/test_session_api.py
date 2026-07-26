@@ -49,10 +49,90 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/read", adapter._handle_mark_session_read)
     app.router.add_get("/api/events", adapter._handle_events)
+    app.router.add_get("/api/conversation-groups", adapter._handle_list_conversation_groups)
+    app.router.add_post("/api/conversation-groups", adapter._handle_create_conversation_group)
+    app.router.add_patch("/api/conversation-groups/{group_id}", adapter._handle_patch_conversation_group)
+    app.router.add_post("/api/conversation-groups/{group_id}/sessions", adapter._handle_assign_conversation_group_sessions)
+    app.router.add_delete("/api/conversation-groups/{group_id}/sessions/{session_id}", adapter._handle_remove_conversation_group_session)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+@pytest.mark.asyncio
+async def test_conversation_group_crud_uses_exact_gateway_session_ids(adapter, session_db):
+    session_db.create_session("wa_real_group_123", "whatsapp")
+    session_db.create_session("api_real_session_456", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        created_resp = await cli.post("/api/conversation-groups", json={
+            "title": "Família",
+            "emoji": "🏡",
+            "whatsapp_group_id": "120363-real@g.us",
+        })
+        assert created_resp.status == 201
+        created = await created_resp.json()
+        group_id = created["group"]["id"]
+        assert created["group"] == {
+            "id": group_id,
+            "title": "Família",
+            "emoji": "🏡",
+            "whatsapp_group_id": "120363-real@g.us",
+            "session_ids": [],
+        }
+
+        assign_resp = await cli.post(
+            f"/api/conversation-groups/{group_id}/sessions",
+            json={"session_ids": ["wa_real_group_123", "api_real_session_456"]},
+        )
+        assert assign_resp.status == 200
+
+        listed_resp = await cli.get("/api/conversation-groups")
+        listed = await listed_resp.json()
+        assert listed["data"][0]["session_ids"] == [
+            "api_real_session_456",
+            "wa_real_group_123",
+        ]
+
+        sessions_resp = await cli.get("/api/sessions?limit=10")
+        sessions = await sessions_resp.json()
+        assert {row["id"]: row["group_id"] for row in sessions["data"]} == {
+            "api_real_session_456": group_id,
+            "wa_real_group_123": group_id,
+        }
+
+        renamed_resp = await cli.patch(
+            f"/api/conversation-groups/{group_id}",
+            json={"title": "Casa", "emoji": "💜"},
+        )
+        assert renamed_resp.status == 200
+        renamed = await renamed_resp.json()
+        assert renamed["group"]["title"] == "Casa"
+        assert renamed["group"]["emoji"] == "💜"
+
+        removed_resp = await cli.delete(
+            f"/api/conversation-groups/{group_id}/sessions/api_real_session_456"
+        )
+        assert removed_resp.status == 200
+        removed = await removed_resp.json()
+        assert removed["removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_conversation_group_rejects_unknown_session(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        created = await (await cli.post(
+            "/api/conversation-groups",
+            json={"title": "Núcleo"},
+        )).json()
+        response = await cli.post(
+            f"/api/conversation-groups/{created['group']['id']}/sessions",
+            json={"session_ids": ["missing-exact-id"]},
+        )
+    assert response.status == 404
 
 
 async def _read_sse_data(response):

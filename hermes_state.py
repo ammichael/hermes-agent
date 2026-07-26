@@ -210,7 +210,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _GATEWAY_EVENT_CONDITIONS_LOCK = threading.Lock()
 _GATEWAY_EVENT_CONDITIONS: Dict[str, threading.Condition] = {}
@@ -1148,6 +1148,23 @@ CREATE TABLE IF NOT EXISTS session_read_cursors (
     PRIMARY KEY (reader_id, session_id)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_groups (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    emoji TEXT,
+    whatsapp_group_id TEXT UNIQUE,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_group_sessions (
+    group_id TEXT NOT NULL REFERENCES conversation_groups(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    assigned_at REAL NOT NULL,
+    PRIMARY KEY (group_id, session_id),
+    UNIQUE (session_id)
+);
+
 CREATE TABLE IF NOT EXISTS gateway_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,
@@ -1225,6 +1242,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_gateway_events_session ON gateway_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_conversation_group_sessions_group
+    ON conversation_group_sessions(group_id);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -4945,6 +4964,198 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def list_conversation_groups(self) -> List[Dict[str, Any]]:
+        """List canonical thematic groups and their exact Gateway sessions."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT g.id, g.title, g.emoji, g.whatsapp_group_id,
+                       g.created_at, g.updated_at, gs.session_id
+                FROM conversation_groups g
+                LEFT JOIN conversation_group_sessions gs ON gs.group_id = g.id
+                ORDER BY g.title COLLATE NOCASE, gs.session_id
+                """
+            ).fetchall()
+        groups: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            group = groups.setdefault(row["id"], {
+                "id": row["id"],
+                "title": row["title"],
+                "emoji": row["emoji"],
+                "whatsapp_group_id": row["whatsapp_group_id"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "session_ids": [],
+            })
+            if row["session_id"]:
+                group["session_ids"].append(row["session_id"])
+        return list(groups.values())
+
+    def create_conversation_group(
+        self,
+        group_id: str,
+        title: str,
+        emoji: Optional[str] = None,
+        whatsapp_group_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO conversation_groups(
+                    id, title, emoji, whatsapp_group_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (group_id, title, emoji, whatsapp_group_id, now, now),
+            )
+            return {
+                "id": group_id,
+                "title": title,
+                "emoji": emoji,
+                "whatsapp_group_id": whatsapp_group_id,
+                "created_at": now,
+                "updated_at": now,
+                "session_ids": [],
+            }
+
+        return self._execute_write(_do)
+
+    def update_conversation_group(
+        self,
+        group_id: str,
+        *,
+        title: Optional[str] = None,
+        emoji: Any = ...,
+        whatsapp_group_id: Any = ...,
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM conversation_groups WHERE id = ?", (group_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE conversation_groups
+                SET title = ?, emoji = ?, whatsapp_group_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title if title is not None else row["title"],
+                    row["emoji"] if emoji is ... else emoji,
+                    row["whatsapp_group_id"] if whatsapp_group_id is ... else whatsapp_group_id,
+                    now,
+                    group_id,
+                ),
+            )
+            return True
+
+        if not self._execute_write(_do):
+            return None
+        return next(
+            (group for group in self.list_conversation_groups() if group["id"] == group_id),
+            None,
+        )
+
+    def assign_conversation_group_sessions(
+        self,
+        group_id: str,
+        session_ids: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        session_ids = list(dict.fromkeys(session_ids))
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM conversation_groups WHERE id = ?", (group_id,)
+            ).fetchone() is None:
+                return "missing_group"
+            missing = [
+                session_id for session_id in session_ids
+                if conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone() is None
+            ]
+            if missing:
+                return ("missing_sessions", missing)
+            for session_id in session_ids:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_group_sessions(
+                        group_id, session_id, assigned_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        group_id = excluded.group_id,
+                        assigned_at = excluded.assigned_at
+                    """,
+                    (group_id, session_id, now),
+                )
+                conn.execute(
+                    "INSERT INTO gateway_events(type, session_id, timestamp) "
+                    "VALUES ('session.updated', ?, ?)",
+                    (session_id, now),
+                )
+            return "ok"
+
+        result = self._execute_write(_do)
+        if result != "ok":
+            return result
+        return next(
+            (group for group in self.list_conversation_groups() if group["id"] == group_id),
+            None,
+        )
+
+    def remove_conversation_group_session(
+        self,
+        group_id: str,
+        session_id: str,
+    ) -> bool:
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM conversation_group_sessions "
+                "WHERE group_id = ? AND session_id = ?",
+                (group_id, session_id),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO gateway_events(type, session_id, timestamp) "
+                    "VALUES ('session.updated', ?, ?)",
+                    (session_id, now),
+                )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def get_session_groups(self, session_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        session_ids = list(dict.fromkeys(session_ids))
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT gs.session_id, g.id AS group_id, g.title AS group_title,
+                       g.emoji AS group_emoji
+                FROM conversation_group_sessions gs
+                JOIN conversation_groups g ON g.id = gs.group_id
+                """
+                f"WHERE session_id IN ({placeholders})",
+                session_ids,
+            ).fetchall()
+        return {
+            row["session_id"]: {
+                "group_id": row["group_id"],
+                "group_title": row["group_title"],
+                "group_emoji": row["group_emoji"],
+            }
+            for row in rows
+        }
 
     def get_session_read_states(
         self,

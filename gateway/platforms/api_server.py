@@ -1774,6 +1774,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/read", self._handle_mark_session_read),
             ("GET", "/api/events", self._handle_events),
+            ("GET", "/api/conversation-groups", self._handle_list_conversation_groups),
+            ("POST", "/api/conversation-groups", self._handle_create_conversation_group),
+            ("PATCH", "/api/conversation-groups/{group_id}", self._handle_patch_conversation_group),
+            ("POST", "/api/conversation-groups/{group_id}/sessions", self._handle_assign_conversation_group_sessions),
+            ("DELETE", "/api/conversation-groups/{group_id}/sessions/{session_id}", self._handle_remove_conversation_group_session),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -2830,6 +2835,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_archive": True,
                 "session_read_cursors": True,
                 "session_events_sse": True,
+                "conversation_groups": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2861,6 +2867,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_read": {"method": "POST", "path": "/api/sessions/{session_id}/read"},
+                "conversation_groups": {"method": "GET", "path": "/api/conversation-groups"},
                 "session_events": {"method": "GET", "path": "/api/events"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
@@ -2981,6 +2988,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "api_call_count", "parent_session_id", "last_active", "preview",
             "archived", "last_message_id", "read_through_message_id",
             "unread_count", "_lineage_root_id",
+            "group_id", "group_title", "group_emoji",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         if "archived" in payload:
@@ -3034,6 +3042,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 "read_through_message_id": None,
                 "unread_count": 0,
             }))
+
+    async def _add_session_groups(
+        self,
+        db: Any,
+        sessions: List[Dict[str, Any]],
+    ) -> None:
+        groups = await asyncio.to_thread(
+            db.get_session_groups,
+            [session["id"] for session in sessions],
+        )
+        for session in sessions:
+            if session["id"] in groups:
+                session.update(groups[session["id"]])
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -3099,6 +3120,7 @@ class APIServerAdapter(BasePlatformAdapter):
             archived_only=archived_only,
         )
         await self._add_session_read_state(db, sessions, reader_id)
+        await self._add_session_groups(db, sessions)
         return web.json_response({
             "object": "list",
             "data": [self._session_response(s) for s in sessions],
@@ -3234,7 +3256,161 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         db = await self._ensure_session_db_async()
         await self._add_session_read_state(db, [session], reader_id)
+        await self._add_session_groups(db, [session])
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+
+    @staticmethod
+    def _clean_group_text(value: Any, field: str, maximum: int, *, required: bool = False):
+        if value is None and not required:
+            return None, None
+        if not isinstance(value, str):
+            return None, f"{field} must be a string"
+        value = value.strip()
+        if (required and not value) or len(value) > maximum or not value.isprintable():
+            return None, f"{field} must be {'1-' if required else '0-'}{maximum} printable characters"
+        return value or None, None
+
+    @staticmethod
+    def _group_response(group: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: group.get(key)
+            for key in ("id", "title", "emoji", "whatsapp_group_id", "session_ids")
+        }
+
+    async def _handle_list_conversation_groups(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable"), status=503)
+        groups = await asyncio.to_thread(db.list_conversation_groups)
+        return web.json_response({
+            "object": "list",
+            "data": [self._group_response(group) for group in groups],
+        })
+
+    async def _handle_create_conversation_group(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        unknown = sorted(set(body) - {"title", "emoji", "whatsapp_group_id"})
+        if unknown:
+            return web.json_response(_openai_error(
+                f"Unsupported group fields: {', '.join(unknown)}"
+            ), status=400)
+        title, error = self._clean_group_text(body.get("title"), "title", 80, required=True)
+        emoji, emoji_error = self._clean_group_text(body.get("emoji"), "emoji", 16)
+        whatsapp_id, whatsapp_error = self._clean_group_text(
+            body.get("whatsapp_group_id"), "whatsapp_group_id", 256
+        )
+        if error or emoji_error or whatsapp_error:
+            return web.json_response(_openai_error(
+                error or emoji_error or whatsapp_error
+            ), status=400)
+        db = await self._ensure_session_db_async()
+        try:
+            group = await asyncio.to_thread(
+                db.create_conversation_group,
+                f"grp_{uuid.uuid4().hex}",
+                title,
+                emoji,
+                whatsapp_id,
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                return web.json_response(_openai_error(
+                    "whatsapp_group_id is already linked"
+                ), status=409)
+            raise
+        return web.json_response({
+            "object": "hermes.conversation_group",
+            "group": self._group_response(group),
+        }, status=201)
+
+    async def _handle_patch_conversation_group(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        unknown = sorted(set(body) - {"title", "emoji", "whatsapp_group_id"})
+        if unknown or not body:
+            return web.json_response(_openai_error("Unsupported or empty group update"), status=400)
+        values: Dict[str, Any] = {}
+        for field, maximum in (("title", 80), ("emoji", 16), ("whatsapp_group_id", 256)):
+            if field not in body:
+                continue
+            value, error = self._clean_group_text(
+                body[field], field, maximum, required=(field == "title")
+            )
+            if error:
+                return web.json_response(_openai_error(error), status=400)
+            values[field] = value
+        db = await self._ensure_session_db_async()
+        group = await asyncio.to_thread(
+            db.update_conversation_group,
+            request.match_info["group_id"],
+            **values,
+        )
+        if group is None:
+            return web.json_response(_openai_error("Conversation group not found"), status=404)
+        return web.json_response({
+            "object": "hermes.conversation_group",
+            "group": self._group_response(group),
+        })
+
+    async def _handle_assign_conversation_group_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        session_ids = body.get("session_ids")
+        if not isinstance(session_ids, list) or not session_ids or any(
+            not isinstance(value, str) or not value.strip() for value in session_ids
+        ):
+            return web.json_response(_openai_error(
+                "session_ids must be a non-empty string array"
+            ), status=400)
+        db = await self._ensure_session_db_async()
+        result = await asyncio.to_thread(
+            db.assign_conversation_group_sessions,
+            request.match_info["group_id"],
+            [value.strip() for value in session_ids],
+        )
+        if result == "missing_group":
+            return web.json_response(_openai_error("Conversation group not found"), status=404)
+        if isinstance(result, tuple) and result[0] == "missing_sessions":
+            return web.json_response(_openai_error(
+                f"Sessions not found: {', '.join(result[1])}"
+            ), status=404)
+        return web.json_response({
+            "object": "hermes.conversation_group",
+            "group": self._group_response(result),
+        })
+
+    async def _handle_remove_conversation_group_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        removed = await asyncio.to_thread(
+            db.remove_conversation_group_session,
+            request.match_info["group_id"],
+            request.match_info["session_id"],
+        )
+        return web.json_response({
+            "object": "hermes.conversation_group_session.removed",
+            "group_id": request.match_info["group_id"],
+            "session_id": request.match_info["session_id"],
+            "removed": removed,
+        }, status=200 if removed else 404)
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
