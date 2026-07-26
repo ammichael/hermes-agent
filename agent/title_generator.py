@@ -39,6 +39,13 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
+_SEMANTIC_TITLE_PROMPT = (
+    "Decide whether this conversation needs a concise 3-7 word title. "
+    "Return KEEP to retain the current title, otherwise return only the new title. "
+    "Rename only for a clear topic change or to replace an empty initial title. "
+    "Use the user's language. No quotes, prefixes, or trailing punctuation."
+)
+
 
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
@@ -158,6 +165,116 @@ def generate_title(
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
         return None
+
+
+def generate_semantic_title(
+    current_title: Optional[str],
+    messages: list,
+    timeout: Optional[float] = None,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: dict = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
+) -> Optional[str]:
+    """Return a proposed title, ``""`` for KEEP, or ``None`` on failure."""
+    if not _auto_title_enabled():
+        return None
+    if runtime_validator is not None and not runtime_validator():
+        return None
+
+    excerpt = "\n".join(
+        f"{message['role'].title()}: {message['content'][:500]}"
+        for message in messages[-12:]
+    )[:4_000]
+    prompt = _SEMANTIC_TITLE_PROMPT
+    language = _title_language()
+    if language:
+        prompt += f" Write in {language}."
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": f"Current title: {current_title or '(none)'}\n\n{excerpt}",
+                },
+            ],
+            max_tokens=80,
+            temperature=0.2,
+            timeout=timeout,
+            main_runtime=main_runtime,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        candidate = strip_think_blocks(
+            None, response.choices[0].message.content or ""
+        ).strip().strip("\"'")
+        if candidate.upper() == "KEEP":
+            return ""
+        if candidate.lower().startswith("title:"):
+            candidate = candidate[6:].strip()
+        return candidate[:80].rstrip(".,:;!?") or None
+    except Exception as exc:
+        logger.warning("Semantic title generation failed: %s", exc)
+        if failure_callback is not None:
+            try:
+                failure_callback("title generation", exc)
+            except Exception:
+                logger.debug("Semantic title failure_callback raised", exc_info=True)
+        return None
+
+
+def _eligible_title_messages(conversation_history: list) -> list:
+    """Project only persisted, human-visible user/assistant text."""
+    eligible = []
+    for message in conversation_history or []:
+        if message.get("role") not in {"user", "assistant"}:
+            continue
+        if message.get("tool_calls") or message.get("tool_call_id"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        eligible.append({"role": message["role"], "content": content.strip()})
+    return eligible
+
+
+def _run_semantic_title(
+    session_db,
+    session_id: str,
+    claim: dict,
+    messages: list,
+    *,
+    failure_callback=None,
+    main_runtime=None,
+    title_callback=None,
+    runtime_validator=None,
+) -> None:
+    milestone = int(claim["milestone"])
+    observed_title = claim.get("title")
+    try:
+        proposed = generate_semantic_title(
+            observed_title,
+            messages,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            runtime_validator=runtime_validator,
+        )
+        if proposed is not None and session_db.finish_semantic_title_milestone(
+            session_id,
+            milestone,
+            observed_title,
+            proposed or None,
+        ):
+            if proposed and title_callback is not None:
+                title_callback(proposed)
+            return
+    except Exception:
+        logger.debug("Semantic title milestone failed", exc_info=True)
+    finally:
+        # Successful completion clears the claim itself; this is a no-op then.
+        session_db.release_semantic_title_milestone(session_id, milestone)
 
 
 def _persist_session_title(session_db, session_id, title):
@@ -347,11 +464,27 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
+    eligible = _eligible_title_messages(conversation_history)
+    claim_fn = getattr(session_db, "claim_semantic_title_milestone", None)
+    claim = claim_fn(session_id, len(eligible)) if callable(claim_fn) else None
+    if isinstance(claim, dict):
+        thread = threading.Thread(
+            target=_run_semantic_title,
+            args=(session_db, session_id, claim, eligible),
+            kwargs={
+                "failure_callback": failure_callback,
+                "main_runtime": main_runtime,
+                "title_callback": title_callback,
+                "runtime_validator": runtime_validator,
+            },
+            daemon=True,
+            name="semantic-title",
+        )
+        thread.start()
+        return
+
+    # Legacy stores keep the original first-exchange behavior.
+    user_msg_count = sum(1 for m in eligible if m["role"] == "user")
     if user_msg_count > 2:
         return
 

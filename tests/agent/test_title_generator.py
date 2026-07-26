@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.title_generator import (
+    _eligible_title_messages,
+    _run_semantic_title,
     generate_title,
+    generate_semantic_title,
     auto_title_session,
     maybe_auto_title,
     _title_language,
@@ -223,6 +226,64 @@ class TestGenerateTitle:
             assert generate_title("question", "answer") is None
 
         mock_call_llm.assert_not_called()
+
+
+class TestSemanticTitles:
+    def test_filters_non_human_turns_and_uses_low_reasoning(self):
+        messages = _eligible_title_messages([
+            {"role": "system", "content": "prompt"},
+            {"role": "user", "content": "Planejar viagem"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "secret"},
+            {"role": "assistant", "content": "Vamos comparar datas"},
+        ])
+        assert messages == [
+            {"role": "user", "content": "Planejar viagem"},
+            {"role": "assistant", "content": "Vamos comparar datas"},
+        ]
+
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "Viagem em família"
+        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+            assert generate_semantic_title(None, messages) == "Viagem em família"
+        assert llm.call_args.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+
+    def test_claims_three_then_twelve_and_manual_title_wins(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="companion", source="companion_ios")
+
+        assert db.claim_semantic_title_milestone("companion", 2) is None
+        first = db.claim_semantic_title_milestone("companion", 3)
+        assert first == {"milestone": 3, "title": None}
+        assert db.claim_semantic_title_milestone("companion", 3) is None
+        assert db.finish_semantic_title_milestone(
+            "companion", 3, None, "Planejamento da viagem"
+        )
+        assert db.claim_semantic_title_milestone("companion", 14) is None
+        second = db.claim_semantic_title_milestone("companion", 15)
+        assert second == {"milestone": 15, "title": "Planejamento da viagem"}
+
+        db.set_session_title("companion", "Título do Mike")
+        assert not db.finish_semantic_title_milestone(
+            "companion", 15, "Planejamento da viagem", "Outro título"
+        )
+        assert db.get_session_title("companion") == "Título do Mike"
+
+    def test_failure_releases_same_milestone_for_retry(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="companion", source="companion_mac")
+        claim = db.claim_semantic_title_milestone("companion", 3)
+        with patch("agent.title_generator.generate_semantic_title", return_value=None):
+            _run_semantic_title(db, "companion", claim, [
+                {"role": "user", "content": "A"},
+                {"role": "assistant", "content": "B"},
+                {"role": "user", "content": "C"},
+            ])
+        assert db.claim_semantic_title_milestone("companion", 3) == claim
 
 
 class TestAutoTitleSession:

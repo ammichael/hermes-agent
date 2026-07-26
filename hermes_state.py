@@ -1099,6 +1099,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_kind TEXT,
+    title_policy_version INTEGER NOT NULL DEFAULT 0,
+    title_last_milestone INTEGER NOT NULL DEFAULT 0,
+    title_claim_milestone INTEGER,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -5497,7 +5501,15 @@ class SessionDB:
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
-        return self._set_session_title(session_id, title, only_if_empty=False)
+        updated = self._set_session_title(session_id, title, only_if_empty=False)
+        if updated:
+            normalized = self.sanitize_title(title)
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET title_kind = ?, title_claim_milestone = NULL "
+                "WHERE id = ?",
+                ("manual" if normalized else None, session_id),
+            ))
+        return updated
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Set an auto-generated title only when the current title is NULL.
@@ -5506,7 +5518,94 @@ class SessionDB:
         rename cannot be overwritten. Validation and uniqueness behavior match
         :meth:`set_session_title`.
         """
-        return self._set_session_title(session_id, title, only_if_empty=True)
+        updated = self._set_session_title(session_id, title, only_if_empty=True)
+        if updated:
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET title_kind = 'auto' WHERE id = ?",
+                (session_id,),
+            ))
+        return updated
+
+    def claim_semantic_title_milestone(
+        self,
+        session_id: str,
+        eligible_count: int,
+        policy_version: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim the next 3/12 semantic-title milestone.
+
+        The initial rollout is deliberately limited to Companion-created
+        sessions. Existing titled sessions with no explicit ``auto`` marker are
+        treated as channel/manual authority and never overwritten.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT source, title, title_kind, title_policy_version, "
+                "title_last_milestone, title_claim_milestone "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["source"] not in {"companion_ios", "companion_mac"}:
+                return None
+            if row["title_kind"] == "manual" or (row["title"] and row["title_kind"] != "auto"):
+                return None
+            last = row["title_last_milestone"] if row["title_policy_version"] == policy_version else 0
+            milestone = 3 if last == 0 else last + 12
+            if eligible_count < milestone or row["title_claim_milestone"] is not None:
+                return None
+            cursor = conn.execute(
+                "UPDATE sessions SET title_policy_version = ?, "
+                "title_claim_milestone = ? WHERE id = ? "
+                "AND title_claim_milestone IS NULL AND title_last_milestone = ?",
+                (policy_version, milestone, session_id, row["title_last_milestone"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return {"milestone": milestone, "title": row["title"]}
+
+        return self._execute_write(_do)
+
+    def finish_semantic_title_milestone(
+        self,
+        session_id: str,
+        milestone: int,
+        observed_title: Optional[str],
+        proposed_title: Optional[str],
+        policy_version: int = 1,
+    ) -> bool:
+        """Finish a claimed milestone without defeating a concurrent manual title."""
+        sanitized = self.sanitize_title(proposed_title) if proposed_title else None
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT title, title_kind, title_claim_milestone FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["title_kind"] == "manual"
+                or row["title_claim_milestone"] != milestone
+                or row["title"] != observed_title
+            ):
+                return False
+            conn.execute(
+                "UPDATE sessions SET title = COALESCE(?, title), "
+                "title_kind = CASE WHEN ? IS NULL THEN title_kind ELSE 'auto' END, "
+                "title_policy_version = ?, title_last_milestone = ?, "
+                "title_claim_milestone = NULL WHERE id = ?",
+                (sanitized, sanitized, policy_version, milestone, session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def release_semantic_title_milestone(self, session_id: str, milestone: int) -> None:
+        """Release a failed claim so the same milestone can retry later."""
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET title_claim_milestone = NULL "
+            "WHERE id = ? AND title_claim_milestone = ?",
+            (session_id, milestone),
+        ))
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
