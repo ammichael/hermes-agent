@@ -10,12 +10,19 @@ Duplication needs a guard, so these tests pin the two implementations in
 agreement across the documented upstream boundaries.
 """
 
+import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+import hermes_state
 from hermes_state import is_sqlite_wal_reset_vulnerable
 from tests.conftest import _wal_is_usable
+
+
+def test_hermetic_fixture_redirects_preimported_default_db():
+    assert hermes_state.DEFAULT_DB_PATH == Path(os.environ["HERMES_HOME"]) / "state.db"
 
 
 @pytest.mark.parametrize(
