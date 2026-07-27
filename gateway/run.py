@@ -10733,6 +10733,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Temporary WhatsApp grants authorize plain conversational text only.
+        # They never enter command, pairing, approval, or action dispatch.
+        if getattr(source, "_whatsapp_temporary_grant_id", None):
+            if event.message_type != MessageType.TEXT or event.get_command():
+                logger.warning(
+                    "Dropping non-text or command input from temporary WhatsApp interaction"
+                )
+                return None
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -14258,6 +14267,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
                         )
+
+            if event.message_id:
+                await self.async_session_store.attach_platform_message_id(
+                    session_entry.session_id,
+                    "user",
+                    str(event.message_id),
+                )
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
@@ -19976,6 +19992,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        if getattr(source, "_whatsapp_temporary_grant_id", None):
+            # An explicit empty list means no model tools. None would select
+            # every toolset, so keep this distinction intentional.
+            enabled_toolsets = []
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

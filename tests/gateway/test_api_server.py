@@ -726,6 +726,7 @@ class TestAgentExecution:
                 requested_model="MiniMax-M3",
                 requested_provider="minimax",
                 model_options=model_options,
+                persist=False,
             )
 
         # _run_agent annotates result with the effective agent.session_id
@@ -739,6 +740,7 @@ class TestAgentExecution:
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
         assert create_kwargs["model_options"] == model_options
+        assert create_kwargs["persist"] is False
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
@@ -1492,6 +1494,27 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_store_false_disables_session_persistence(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "internal check"}],
+                        "store": False,
+                    },
+                )
+
+        assert response.status == 200
+        assert mock_run.call_args.kwargs["persist"] is False
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):
@@ -5147,6 +5170,10 @@ class TestSessionDbOffEventLoop:
     gateway build_channel_directory, #60794 / #60810), so each call is wrapped
     in asyncio.to_thread.
     """
+
+    def test_companion_session_sources_remain_canonical(self, auth_adapter):
+        assert auth_adapter._normalize_session_source("companion_ios") == "companion_ios"
+        assert auth_adapter._normalize_session_source("companion_mac") == "companion_mac"
 
     @pytest.mark.asyncio
     async def test_get_existing_session_or_404_offloads(self, auth_adapter):

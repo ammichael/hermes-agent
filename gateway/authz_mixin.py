@@ -401,6 +401,25 @@ class GatewayAuthorizationMixin:
 
         user_id = source.user_id
 
+        # A temporary WhatsApp interaction is a separate, expiring capability
+        # created by the bridge only after a successful outbound text delivery.
+        # It is deliberately not copied into any allowlist or pairing store.
+        temporary_grant_id = str(
+            getattr(source, "_whatsapp_temporary_grant_id", "") or ""
+        ).strip()
+        if temporary_grant_id:
+            try:
+                from gateway.whatsapp_temporary_grants import (
+                    find_temporary_interaction_grant,
+                )
+
+                grant = find_temporary_interaction_grant(source)
+                if grant is not None and grant.get("id") == temporary_grant_id:
+                    return True
+            except Exception:
+                pass
+            return False
+
         # Telegram (and similar) authorize entire group/forum/channel chats
         # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
         # That allowlist is chat-scoped, so it must work even when

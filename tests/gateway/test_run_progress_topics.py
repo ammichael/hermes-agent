@@ -1339,6 +1339,15 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 async def test_base_processing_releases_post_delivery_callback_after_main_send():
     """Post-delivery callbacks on the adapter fire after the main response."""
     adapter = ProgressCaptureAdapter()
+    attached = []
+
+    class Store:
+        async def attach_platform_message_id_for_session_key(
+            self, session_key, role, platform_message_id
+        ):
+            attached.append((session_key, role, platform_message_id))
+
+    adapter.gateway_runner = SimpleNamespace(async_session_store=Store())
 
     async def _handler(event):
         return "done"
@@ -1379,6 +1388,7 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
     sent_texts = [call["content"] for call in adapter.sent]
     assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
     assert released == [True]
+    assert attached == [(session_key, "assistant", "progress-1")]
 
 
 @pytest.mark.asyncio

@@ -210,7 +210,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _GATEWAY_EVENT_CONDITIONS_LOCK = threading.Lock()
 _GATEWAY_EVENT_CONDITIONS: Dict[str, threading.Condition] = {}
@@ -1099,6 +1099,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_kind TEXT,
+    title_policy_version INTEGER NOT NULL DEFAULT 0,
+    title_last_milestone INTEGER NOT NULL DEFAULT 0,
+    title_claim_milestone INTEGER,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -1146,6 +1150,23 @@ CREATE TABLE IF NOT EXISTS session_read_cursors (
     message_id INTEGER NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (reader_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_groups (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    emoji TEXT,
+    whatsapp_group_id TEXT UNIQUE,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_group_sessions (
+    group_id TEXT NOT NULL REFERENCES conversation_groups(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    assigned_at REAL NOT NULL,
+    PRIMARY KEY (group_id, session_id),
+    UNIQUE (session_id)
 );
 
 CREATE TABLE IF NOT EXISTS gateway_events (
@@ -1225,6 +1246,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_gateway_events_session ON gateway_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_conversation_group_sessions_group
+    ON conversation_group_sessions(group_id);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -4946,6 +4969,241 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def list_conversation_groups(self) -> List[Dict[str, Any]]:
+        """List canonical thematic groups and their exact Gateway sessions."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT g.id, g.title, g.emoji, g.whatsapp_group_id,
+                       g.created_at, g.updated_at, gs.session_id
+                FROM conversation_groups g
+                LEFT JOIN conversation_group_sessions gs ON gs.group_id = g.id
+                ORDER BY g.title COLLATE NOCASE, gs.session_id
+                """
+            ).fetchall()
+        groups: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            group = groups.setdefault(row["id"], {
+                "id": row["id"],
+                "title": row["title"],
+                "emoji": row["emoji"],
+                "whatsapp_group_id": row["whatsapp_group_id"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "session_ids": [],
+            })
+            if row["session_id"]:
+                group["session_ids"].append(row["session_id"])
+        return list(groups.values())
+
+    def create_conversation_group(
+        self,
+        group_id: str,
+        title: str,
+        emoji: Optional[str] = None,
+        whatsapp_group_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO conversation_groups(
+                    id, title, emoji, whatsapp_group_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (group_id, title, emoji, whatsapp_group_id, now, now),
+            )
+            return {
+                "id": group_id,
+                "title": title,
+                "emoji": emoji,
+                "whatsapp_group_id": whatsapp_group_id,
+                "created_at": now,
+                "updated_at": now,
+                "session_ids": [],
+            }
+
+        return self._execute_write(_do)
+
+    def upsert_conversation_group(
+        self,
+        group_id: str,
+        title: str,
+        emoji: Optional[str],
+        whatsapp_group_id: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        """Idempotently create/update the group bound to a real WhatsApp JID."""
+        now = time.time()
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id FROM conversation_groups WHERE whatsapp_group_id = ?",
+                (whatsapp_group_id,),
+            ).fetchone()
+            effective_id = existing["id"] if existing else group_id
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE conversation_groups
+                    SET title = ?, emoji = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (title, emoji, now, effective_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_groups(
+                        id, title, emoji, whatsapp_group_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (effective_id, title, emoji, whatsapp_group_id, now, now),
+                )
+            return effective_id, existing is None
+
+        effective_id, created = self._execute_write(_do)
+        group = next(
+            group for group in self.list_conversation_groups()
+            if group["id"] == effective_id
+        )
+        return group, created
+
+    def update_conversation_group(
+        self,
+        group_id: str,
+        *,
+        title: Optional[str] = None,
+        emoji: Any = ...,
+        whatsapp_group_id: Any = ...,
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM conversation_groups WHERE id = ?", (group_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE conversation_groups
+                SET title = ?, emoji = ?, whatsapp_group_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title if title is not None else row["title"],
+                    row["emoji"] if emoji is ... else emoji,
+                    row["whatsapp_group_id"] if whatsapp_group_id is ... else whatsapp_group_id,
+                    now,
+                    group_id,
+                ),
+            )
+            return True
+
+        if not self._execute_write(_do):
+            return None
+        return next(
+            (group for group in self.list_conversation_groups() if group["id"] == group_id),
+            None,
+        )
+
+    def assign_conversation_group_sessions(
+        self,
+        group_id: str,
+        session_ids: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        session_ids = list(dict.fromkeys(session_ids))
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM conversation_groups WHERE id = ?", (group_id,)
+            ).fetchone() is None:
+                return "missing_group"
+            missing = [
+                session_id for session_id in session_ids
+                if conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone() is None
+            ]
+            if missing:
+                return ("missing_sessions", missing)
+            for session_id in session_ids:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_group_sessions(
+                        group_id, session_id, assigned_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        group_id = excluded.group_id,
+                        assigned_at = excluded.assigned_at
+                    """,
+                    (group_id, session_id, now),
+                )
+                conn.execute(
+                    "INSERT INTO gateway_events(type, session_id, timestamp) "
+                    "VALUES ('session.updated', ?, ?)",
+                    (session_id, now),
+                )
+            return "ok"
+
+        result = self._execute_write(_do)
+        if result != "ok":
+            return result
+        return next(
+            (group for group in self.list_conversation_groups() if group["id"] == group_id),
+            None,
+        )
+
+    def remove_conversation_group_session(
+        self,
+        group_id: str,
+        session_id: str,
+    ) -> bool:
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM conversation_group_sessions "
+                "WHERE group_id = ? AND session_id = ?",
+                (group_id, session_id),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO gateway_events(type, session_id, timestamp) "
+                    "VALUES ('session.updated', ?, ?)",
+                    (session_id, now),
+                )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def get_session_groups(self, session_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        session_ids = list(dict.fromkeys(session_ids))
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT gs.session_id, g.id AS group_id, g.title AS group_title,
+                       g.emoji AS group_emoji
+                FROM conversation_group_sessions gs
+                JOIN conversation_groups g ON g.id = gs.group_id
+                """
+                f"WHERE session_id IN ({placeholders})",
+                session_ids,
+            ).fetchall()
+        return {
+            row["session_id"]: {
+                "group_id": row["group_id"],
+                "group_title": row["group_title"],
+                "group_emoji": row["group_emoji"],
+            }
+            for row in rows
+        }
+
     def get_session_read_states(
         self,
         reader_id: Optional[str],
@@ -5243,7 +5501,15 @@ class SessionDB:
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
-        return self._set_session_title(session_id, title, only_if_empty=False)
+        updated = self._set_session_title(session_id, title, only_if_empty=False)
+        if updated:
+            normalized = self.sanitize_title(title)
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET title_kind = ?, title_claim_milestone = NULL "
+                "WHERE id = ?",
+                ("manual" if normalized else None, session_id),
+            ))
+        return updated
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Set an auto-generated title only when the current title is NULL.
@@ -5252,7 +5518,94 @@ class SessionDB:
         rename cannot be overwritten. Validation and uniqueness behavior match
         :meth:`set_session_title`.
         """
-        return self._set_session_title(session_id, title, only_if_empty=True)
+        updated = self._set_session_title(session_id, title, only_if_empty=True)
+        if updated:
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET title_kind = 'auto' WHERE id = ?",
+                (session_id,),
+            ))
+        return updated
+
+    def claim_semantic_title_milestone(
+        self,
+        session_id: str,
+        eligible_count: int,
+        policy_version: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim the next 3/12 semantic-title milestone.
+
+        The initial rollout is deliberately limited to Companion-created
+        sessions. Existing titled sessions with no explicit ``auto`` marker are
+        treated as channel/manual authority and never overwritten.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT source, title, title_kind, title_policy_version, "
+                "title_last_milestone, title_claim_milestone "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["source"] not in {"companion_ios", "companion_mac"}:
+                return None
+            if row["title_kind"] == "manual" or (row["title"] and row["title_kind"] != "auto"):
+                return None
+            last = row["title_last_milestone"] if row["title_policy_version"] == policy_version else 0
+            milestone = 3 if last == 0 else last + 12
+            if eligible_count < milestone or row["title_claim_milestone"] is not None:
+                return None
+            cursor = conn.execute(
+                "UPDATE sessions SET title_policy_version = ?, "
+                "title_claim_milestone = ? WHERE id = ? "
+                "AND title_claim_milestone IS NULL AND title_last_milestone = ?",
+                (policy_version, milestone, session_id, row["title_last_milestone"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return {"milestone": milestone, "title": row["title"]}
+
+        return self._execute_write(_do)
+
+    def finish_semantic_title_milestone(
+        self,
+        session_id: str,
+        milestone: int,
+        observed_title: Optional[str],
+        proposed_title: Optional[str],
+        policy_version: int = 1,
+    ) -> bool:
+        """Finish a claimed milestone without defeating a concurrent manual title."""
+        sanitized = self.sanitize_title(proposed_title) if proposed_title else None
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT title, title_kind, title_claim_milestone FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["title_kind"] == "manual"
+                or row["title_claim_milestone"] != milestone
+                or row["title"] != observed_title
+            ):
+                return False
+            conn.execute(
+                "UPDATE sessions SET title = COALESCE(?, title), "
+                "title_kind = CASE WHEN ? IS NULL THEN title_kind ELSE 'auto' END, "
+                "title_policy_version = ?, title_last_milestone = ?, "
+                "title_claim_milestone = NULL WHERE id = ?",
+                (sanitized, sanitized, policy_version, milestone, session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def release_semantic_title_milestone(self, session_id: str, milestone: int) -> None:
+        """Release a failed claim so the same milestone can retry later."""
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET title_claim_milestone = NULL "
+            "WHERE id = ? AND title_claim_milestone = ?",
+            (session_id, milestone),
+        ))
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -8348,6 +8701,34 @@ class SessionDB:
                 (session_id, platform_message_id),
             )
             return cursor.fetchone() is not None
+
+    def attach_platform_message_id(
+        self, session_id: str, role: str, platform_message_id: str
+    ) -> bool:
+        """Attach a platform ACK to the newest unbound message of ``role``."""
+        if role not in {"user", "assistant"} or not platform_message_id:
+            return False
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE messages SET platform_message_id = ? "
+                "WHERE id = ("
+                "  SELECT id FROM messages "
+                "  WHERE session_id = ? AND role = ? "
+                "    AND platform_message_id IS NULL "
+                "  ORDER BY id DESC LIMIT 1"
+                ") AND NOT EXISTS ("
+                "  SELECT 1 FROM messages "
+                "  WHERE session_id = ? AND platform_message_id = ?"
+                ")",
+                (
+                    platform_message_id,
+                    session_id,
+                    role,
+                    session_id,
+                    platform_message_id,
+                ),
+            )
+            return cursor.rowcount == 1
 
     # =========================================================================
     # Export and cleanup

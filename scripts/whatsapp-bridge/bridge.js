@@ -30,9 +30,16 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { expandWhatsAppIdentifiers, matchesAllowedUser, normalizeWhatsAppIdentifier, parseAllowedUsers } from './allowlist.js';
+import { appendConversationHistory, readConversationHistory } from './conversation_history.js';
+import { recordReadOnlyReplyWatch } from './reply_watch.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import {
+  createTemporaryInteractionGrant,
+  findTemporaryInteractionGrant,
+  validateTemporaryInteractionRequest,
+} from './temporary_interaction.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -77,6 +84,8 @@ const FORWARD_OWNER_MESSAGES =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const HISTORY_DIR = process.env.HERMES_WHATSAPP_HISTORY_DIR
+  || path.join(process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes'), 'state', 'whatsapp-conversations');
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -197,6 +206,29 @@ function trackSentMessageId(sent) {
 function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
+}
+
+function canonicalConversationJid(chatId) {
+  const raw = normalizeWhatsAppIdentifier(chatId);
+  if (!raw) return '';
+  if (!String(chatId).endsWith('@lid')) return `${raw}@s.whatsapp.net`;
+  const phoneAlias = [...expandWhatsAppIdentifiers(chatId, SESSION_DIR)]
+    .find((candidate) => candidate !== raw && existsSync(path.join(SESSION_DIR, `lid-mapping-${candidate}.json`)));
+  return `${phoneAlias || raw}${phoneAlias ? '@s.whatsapp.net' : '@lid'}`;
+}
+
+function archiveConversationMessage({ msg, chatId, senderId, isGroup, body }) {
+  return appendConversationHistory({
+    rootDir: HISTORY_DIR,
+    chatJid: chatId,
+    conversationJid: canonicalConversationJid(chatId),
+    senderJid: senderId,
+    messageId: msg.key?.id,
+    timestampMs: Number(msg.messageTimestamp) * 1000,
+    fromMe: !!msg.key?.fromMe,
+    isGroup,
+    body,
+  });
 }
 
 function redactWhatsAppId(value) {
@@ -395,6 +427,9 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
+    // WhatsApp terminates a first-time pairing handshake when history sync is
+    // requested before the account has completed registration. Keep the
+    // established web identity and defer history sync until after pairing.
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -517,6 +552,22 @@ async function startSocket() {
     }
   });
 
+  sock.ev.on('messaging-history.set', ({ messages = [] }) => {
+    for (const msg of messages) {
+      if (!msg?.message || !msg.key?.remoteJid) continue;
+      const chatId = msg.key.remoteJid;
+      const senderId = msg.key.participant || chatId;
+      const content = getMessageContent(msg);
+      archiveConversationMessage({
+        msg,
+        chatId,
+        senderId,
+        isGroup: chatId.endsWith('@g.us'),
+        body: content.conversation || content.extendedTextMessage?.text || '',
+      });
+    }
+  });
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
@@ -534,6 +585,30 @@ async function startSocket() {
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
+      const messageContent = getMessageContent(msg);
+      const contentKeys = Object.keys(messageContent || {});
+      const isTextOnly = contentKeys.length === 1
+        && ['conversation', 'extendedTextMessage'].includes(contentKeys[0]);
+      const plainBody = messageContent.conversation || messageContent.extendedTextMessage?.text || '';
+      archiveConversationMessage({ msg, chatId, senderId, isGroup, body: plainBody });
+      const readOnlyWatch = recordReadOnlyReplyWatch({
+        chatJid: chatId,
+        senderJid: senderId,
+        messageId: msg.key.id,
+        timestampMs: Number(msg.messageTimestamp) * 1000,
+        body: plainBody,
+        isGroup,
+        fromMe: !!msg.key.fromMe,
+      });
+      if (readOnlyWatch.recorded) {
+        emitDebugEvent({
+          stage: 'read_only_reply_watch_recorded',
+          watchId: readOnlyWatch.watchId,
+          chatId: redactWhatsAppId(chatId),
+          senderId: redactWhatsAppId(senderId),
+        });
+      }
+      let temporaryInteractionGrant = null;
       emitDebugEvent({
         stage: 'upsert',
         type,
@@ -634,7 +709,20 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        const permanentlyAllowed = matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+        if (!permanentlyAllowed) {
+          temporaryInteractionGrant = findTemporaryInteractionGrant({
+            chatJid: chatId,
+            senderJid: senderId,
+            isGroup,
+            isTextOnly,
+          });
+        }
+        if (
+          WHATSAPP_DM_POLICY !== 'pairing'
+          && !permanentlyAllowed
+          && !temporaryInteractionGrant
+        ) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -647,7 +735,6 @@ async function startSocket() {
         }
       }
 
-      const messageContent = getMessageContent(msg);
       if (messageContent.pollUpdateMessage) {
         const pollUpdateMessage = messageContent.pollUpdateMessage;
         const pollKey = pollUpdateMessage.pollCreationMessageKey || {
@@ -722,6 +809,9 @@ async function startSocket() {
         },
       });
       event.fromOwner = fromOwner;
+      if (temporaryInteractionGrant) {
+        event.temporaryInteractionGrantId = temporaryInteractionGrant.id;
+      }
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -807,18 +897,36 @@ app.get('/messages', (req, res) => {
   res.json(msgs);
 });
 
+// Read retained direct-message history from this bridge's own WhatsApp account.
+app.get('/history/:chatId', (req, res) => {
+  const limit = Math.max(1, Math.min(Number.parseInt(req.query.limit, 10) || 200, 2000));
+  const records = readConversationHistory({
+    rootDir: HISTORY_DIR,
+    chatJid: canonicalConversationJid(decodeURIComponent(req.params.chatId)),
+  });
+  res.json(records.slice(-limit));
+});
+
 // Send a message
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, temporaryInteraction } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
   try {
+    const interactionRequest = temporaryInteraction
+      ? validateTemporaryInteractionRequest({
+          chatJid: chatId,
+          participantJids: temporaryInteraction.participantJids,
+          topic: temporaryInteraction.topic,
+          ttlSeconds: temporaryInteraction.ttlSeconds,
+        })
+      : null;
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
@@ -830,16 +938,33 @@ app.post('/send', async (req, res) => {
       const sent = await sendWithTimeout(chatId, payload, options);
       trackSentMessageId(sent);
       messageStore.remember(sent);
+      archiveConversationMessage({
+        msg: { key: sent?.key, messageTimestamp: sent?.messageTimestamp || Math.floor(Date.now() / 1000) },
+        chatId,
+        senderId: sock.user?.id || '',
+        isGroup: chatId.endsWith('@g.us'),
+        body: chunks[i],
+      });
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
       }
     }
+    const interactionGrant = interactionRequest
+      ? createTemporaryInteractionGrant({
+          chatJid: interactionRequest.chatJid,
+          participantJids: interactionRequest.participantJids,
+          topic: interactionRequest.topic,
+          ttlSeconds: interactionRequest.ttlSeconds,
+          deliveryMessageIds: messageIds,
+        })
+      : null;
 
     res.json({
       success: true,
       messageId: messageIds[messageIds.length - 1],
       messageIds,
+      temporaryInteractionGrantId: interactionGrant?.id,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

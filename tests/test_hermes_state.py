@@ -7424,3 +7424,19 @@ class TestDisplayMetadataPersistence:
         assert len(switched) == 1
         assert switched[0]["display_metadata"] == meta
 
+
+def test_attach_platform_message_id_updates_latest_matching_role(db):
+    db.create_session("s1", source="whatsapp")
+    db.append_message("s1", "user", "pergunta")
+    db.append_message("s1", "assistant", "resposta antiga")
+    db.append_message("s1", "assistant", "resposta atual")
+
+    assert db.attach_platform_message_id("s1", "assistant", "wa-123")
+
+    rows = db._conn.execute(
+        "SELECT content, platform_message_id FROM messages "
+        "WHERE session_id = 's1' ORDER BY id"
+    ).fetchall()
+    assert rows[-2]["platform_message_id"] is None
+    assert rows[-1]["platform_message_id"] == "wa-123"
+    assert not db.attach_platform_message_id("s1", "assistant", "wa-123")

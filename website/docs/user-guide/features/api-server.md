@@ -57,7 +57,7 @@ Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI i
 
 ### POST /v1/chat/completions
 
-Standard OpenAI Chat Completions format. Stateless — the full conversation is included in each request via the `messages` array.
+Standard OpenAI Chat Completions format. Stateless — the full conversation is included in each request via the `messages` array. Internal one-shot jobs can send `"store": false` to avoid writing a session or transcript to the Hermes catalog; the default remains `true` for compatibility.
 
 **Request:**
 ```json

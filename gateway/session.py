@@ -2479,6 +2479,20 @@ class SessionStore:
                     display_name=entry.display_name,
                 )
 
+    def attach_platform_message_id_for_session_key(
+        self, session_key: str, role: str, platform_message_id: str
+    ) -> bool:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            session_id = entry.session_id if entry else None
+        return bool(
+            session_id
+            and self.attach_platform_message_id(
+                session_id, role, platform_message_id
+            )
+        )
+
     def get_session_metadata(
         self,
         session_key: str,
@@ -3079,6 +3093,19 @@ class SessionStore:
             )
         except Exception:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
+            return False
+
+    def attach_platform_message_id(
+        self, session_id: str, role: str, platform_message_id: str
+    ) -> bool:
+        if not self._db:
+            return False
+        try:
+            return self._db.attach_platform_message_id(
+                session_id, role, platform_message_id
+            )
+        except Exception:
+            logger.debug("attach_platform_message_id failed", exc_info=True)
             return False
 
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:

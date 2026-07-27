@@ -5330,6 +5330,15 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if result.success and result.message_id:
+                        runner = getattr(delivery_adapter, "gateway_runner", None)
+                        store = getattr(runner, "async_session_store", None)
+                        if store is not None:
+                            await store.attach_platform_message_id_for_session_key(
+                                session_key,
+                                "assistant",
+                                str(result.message_id),
+                            )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
