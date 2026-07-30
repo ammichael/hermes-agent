@@ -3210,6 +3210,59 @@ def run_job(
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+        # Purpose-based role pins (``model: role:<purpose>``) resolve through
+        # config.yaml ``inference.roles`` + ``inference.routes`` on every tick.
+        # Concrete provider/model/base_url from the route replace the role
+        # reference before provider auth so the literal ``role:...`` string
+        # never reaches an inference API (HTTP 404/400).
+        _role_resolved_provider = None
+        _role_resolved_base_url = None
+        if isinstance(model, str) and model.startswith("role:"):
+            from hermes_cli.inference_roles import (
+                InferenceRoleError,
+                resolve_inference_role,
+                validate_inference_role_job_fields,
+            )
+            try:
+                validate_inference_role_job_fields(
+                    model,
+                    job.get("provider"),
+                    job.get("base_url"),
+                )
+                _resolved_role = resolve_inference_role(model, _cfg)
+            except InferenceRoleError as exc:
+                raise RuntimeError(
+                    f"Cron job '{job_name}' {exc}"
+                ) from exc
+            if not _resolved_role:
+                raise RuntimeError(
+                    f"Cron job '{job_name}' model {model!r} is not a resolvable "
+                    f"inference role reference."
+                )
+            if str(_resolved_role["model"]).startswith("role:"):
+                raise RuntimeError(
+                    f"Cron job '{job_name}' inference route "
+                    f"{_resolved_role['route']!r} must terminate on a concrete "
+                    f"model, not another role reference."
+                )
+            model = _resolved_role["model"]
+            _role_resolved_provider = _resolved_role["provider"]
+            _role_resolved_base_url = _resolved_role.get("base_url")
+            logger.info(
+                "Job '%s': resolved inference role to provider=%s model=%s",
+                job_id,
+                _role_resolved_provider,
+                model,
+            )
+
+        # Sink guard: a role reference must never leave this function as the
+        # effective model. If resolution was skipped/broken, fail locally.
+        if isinstance(model, str) and model.startswith("role:"):
+            raise RuntimeError(
+                f"Cron job '{job_name}' unresolved_reference: effective model "
+                f"is still {model!r}; refusing to call the provider."
+            )
+
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
@@ -3287,7 +3340,7 @@ def run_job(
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
+            str(job.get("provider") or _role_resolved_provider or "").strip().lower()
             or configured_provider_for_drift
             or None
         )
@@ -3298,18 +3351,24 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                # Per-job user pin wins; otherwise the cron-fleet default
-                # provider (cron.model_provider); otherwise resolve from
-                # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                # Per-job user pin wins; else purpose-role route provider; else
+                # the cron-fleet default provider (cron.model_provider); else
+                # resolve from persisted global config.
+                "requested": (
+                    job.get("provider")
+                    or _role_resolved_provider
+                    or _cron_default_provider
+                    or None
+                ),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
                 # below, which already passes its fb_model.
                 "target_model": model,
             }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            _effective_base_url = job.get("base_url") or _role_resolved_base_url
+            if _effective_base_url:
+                runtime_kwargs["explicit_base_url"] = _effective_base_url
             runtime = resolve_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()

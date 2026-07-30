@@ -1211,6 +1211,11 @@ def _compute_provider_model_snapshots(
     if bool(no_agent):
         return None, None
 
+    # Purpose-role pins intentionally remount through config each tick; do not
+    # freeze concrete provider/model snapshots that would fight role hot-swap.
+    if isinstance(normalized_model, str) and normalized_model.startswith("role:"):
+        return None, None
+
     provider_snapshot: Optional[str] = None
     model_snapshot: Optional[str] = None
     if normalized_provider is None:
