@@ -16583,6 +16583,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if message_text is None:
             return
 
+        # Email inbox: explicit WA reply to digest → apply feedback without agent.
+        try:
+            _email_reply_id = getattr(event, "reply_to_message_id", None)
+            _email_reply_own = bool(getattr(event, "reply_to_is_own_message", False))
+            if _email_reply_id and _email_reply_own and message_text:
+                import asyncio as _asyncio_email_wa
+                def _email_wa_try():
+                    import importlib.util
+                    from pathlib import Path as _P
+                    _path = _P.home() / ".hermes" / "scripts" / "email_wa_reply.py"
+                    if not _path.is_file():
+                        return None
+                    _spec = importlib.util.spec_from_file_location("email_wa_reply", _path)
+                    if _spec is None or _spec.loader is None:
+                        return None
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    return _mod.try_handle_gateway_reply(
+                        reply_to_message_id=str(_email_reply_id),
+                        text=str(message_text),
+                    )
+                _email_ack = await _asyncio_email_wa.to_thread(_email_wa_try)
+                if _email_ack:
+                    _adapter = self._adapter_for_source(source)
+                    if _adapter is not None:
+                        await _adapter.send(source.chat_id, _email_ack)
+                    return
+        except Exception:
+            logger.debug("email WA reply intercept failed", exc_info=True)
+
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
         # This runs regardless of the toggle so storage stays clean and the
