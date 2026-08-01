@@ -349,6 +349,37 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
+# Identity vars Buzz Desktop / buzz-acp inject into managed agent children.
+# They sit on the provider blocklist (gateway messaging secrets), which is
+# correct for normal Hermes terminals — but under BUZZ_MANAGED_AGENT the
+# agent *is* the Buzz identity and must be able to run `buzz` CLI.
+_BUZZ_MANAGED_IDENTITY_ENV_KEYS = (
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_RELAY_URL",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_MANAGED_AGENT",
+    "BUZZ_CLI_PATH",
+)
+
+
+def _restore_buzz_managed_identity_env(
+    run_env: dict,
+    source_env=None,
+) -> dict:
+    """Re-inject Buzz identity env when this process is a managed agent.
+
+    # ponytail: restore only under BUZZ_MANAGED_AGENT; never open blocklist globally.
+    """
+    src = source_env if source_env is not None else os.environ
+    if not src.get("BUZZ_MANAGED_AGENT"):
+        return run_env
+    for key in _BUZZ_MANAGED_IDENTITY_ENV_KEYS:
+        val = src.get(key)
+        if val is not None and val != "":
+            run_env[key] = val
+    return run_env
+
+
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
@@ -496,6 +527,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
+    sanitized = _restore_buzz_managed_identity_env(sanitized, base_env or os.environ)
 
     return sanitized
 
@@ -1266,6 +1298,8 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
+    # terminal path uses this helper, not only _sanitize_subprocess_env
+    run_env = _restore_buzz_managed_identity_env(run_env, merged)
 
     return run_env
 
