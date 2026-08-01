@@ -50,6 +50,16 @@ class TestParseProfileRoutes:
         assert parse_profile_routes(None) == []
         assert parse_profile_routes([]) == []
 
+    def test_authorized_users_are_normalized(self):
+        routes = parse_profile_routes([{
+            "name": "wa",
+            "platform": "whatsapp",
+            "profile": "tibiaura",
+            "chat_id": "group",
+            "authorized_users": [" user-a ", "user-b"],
+        }])
+        assert routes[0].authorized_users == ("user-a", "user-b")
+
 
 class TestMatchProfileRoute:
 

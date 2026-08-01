@@ -54,6 +54,10 @@ profile_routes:
     profile: standup
 ```
 
+Routes may optionally set `authorized_users` to a list of sender IDs. When
+present, the route is a hard authorization boundary in addition to the
+platform's own access policy.
+
 ### Fields
 
 | Field | Required | Description |
@@ -65,6 +69,7 @@ profile_routes:
 | `chat_id` | no | Channel/group/DM id. |
 | `thread_id` | no | Thread id within a channel. |
 | `enabled` | no | Default `true`; set `false` to disable a route without removing it. |
+| `authorized_users` | no | Sender IDs allowed by this route; when set, unmatched senders are denied. |
 
 ## Matching rules
 

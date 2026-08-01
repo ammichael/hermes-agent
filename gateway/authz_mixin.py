@@ -374,6 +374,26 @@ class GatewayAuthorizationMixin:
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
+        route_resolver = getattr(self, "_profile_route_for_source", None)
+        if callable(route_resolver):
+            try:
+                route = route_resolver(source)
+            except Exception:
+                # A configured route authorization boundary must fail closed.
+                return False
+            route_users = tuple(getattr(route, "authorized_users", ()) or ())
+            if route_users:
+                source_users = {
+                    str(value).strip()
+                    for value in (
+                        getattr(source, "user_id", None),
+                        getattr(source, "user_id_alt", None),
+                    )
+                    if str(value or "").strip()
+                }
+                if not source_users.intersection(route_users):
+                    return False
+
         adapter_profile = self._adapter_profile_for_source(source)
 
         # Relay (and any adapter whose authorization is enforced by a trusted

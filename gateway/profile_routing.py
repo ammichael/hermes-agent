@@ -58,6 +58,7 @@ class ProfileRoute:
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
     enabled: bool = True
+    authorized_users: tuple[str, ...] = ()
 
     @property
     def specificity(self) -> int:
@@ -102,6 +103,16 @@ class ProfileRoute:
         return True
 
 
+def _coerce_string_tuple(raw: Any) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        return ()
+    return tuple(str(value).strip() for value in values if str(value).strip())
+
+
 def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRoute]:
     """Parse profile_routes from config.yaml into ProfileRoute objects.
 
@@ -143,6 +154,7 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 chat_id=entry.get("chat_id"),
                 thread_id=entry.get("thread_id"),
                 enabled=entry.get("enabled", True),
+                authorized_users=_coerce_string_tuple(entry.get("authorized_users")),
             )
         )
     # Sort: most specific first so the first match wins.

@@ -19,6 +19,7 @@ def mock_runner():
     runner = MagicMock(spec=GatewayRunner)
     runner.config = MagicMock(profile_routes=[])
     # Bind the actual methods to the mock
+    runner._profile_route_for_source = GatewayRunner._profile_route_for_source.__get__(runner)
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     return runner

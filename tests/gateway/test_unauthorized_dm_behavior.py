@@ -117,6 +117,43 @@ def test_whatsapp_lid_user_matches_phone_allowlist_via_modern_session_mapping(
     assert runner._is_user_authorized(source) is True
 
 
+def test_profile_route_authorized_users_are_enforced_before_global_allow_all(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+
+    from gateway.profile_routing import ProfileRoute
+
+    route = ProfileRoute(
+        name="tibiaura",
+        platform="whatsapp",
+        profile="tibiaura",
+        chat_id="group",
+        authorized_users=("allowed",),
+    )
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        profile_routes=[route],
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, _adapter = _make_runner(Platform.WHATSAPP, config)
+
+    denied = SessionSource(
+        platform=Platform.WHATSAPP,
+        user_id="not-allowed",
+        chat_id="group",
+        chat_type="group",
+    )
+    allowed = SessionSource(
+        platform=Platform.WHATSAPP,
+        user_id="allowed",
+        chat_id="group",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(denied) is False
+    assert runner._is_user_authorized(allowed) is True
+
+
 def test_simplex_allowlist_accepts_display_name(monkeypatch):
     """SIMPLEX_ALLOWED_USERS should match the contact's display name as well
     as the numeric contactId. The SimpleX UI surfaces only display names, so
