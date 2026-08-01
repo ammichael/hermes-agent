@@ -191,9 +191,32 @@ def cron_list(show_all: bool = False):
 
 
 def cron_tick():
-    """Run due jobs once and exit."""
+    """Run due jobs once and exit.
+
+    Profile LaunchAgents (e.g. ai.hermes.cron-nfo) call this path instead of the
+    in-gateway ticker loop. Record the same heartbeat/success markers the loop
+    writes so `hermes cron status` and Cron Health do not treat a healthy
+    tick-and-exit agent as stalled.
+    """
+    from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
     from cron.scheduler import tick
-    tick(verbose=True)
+
+    ok = False
+    err: Optional[str] = None
+    try:
+        tick(verbose=True)
+        ok = True
+    except BaseException as exc:
+        # Match gateway ticker: keep process exit meaningful, but always leave
+        # a liveness fingerprint for external monitors.
+        err = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        record_ticker_heartbeat(success=ok)
+        if ok:
+            clear_ticker_error()
+        elif err:
+            record_ticker_error(err)
 
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
