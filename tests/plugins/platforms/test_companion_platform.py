@@ -1,13 +1,16 @@
 """Plugin de plataforma companion: backfill, devices, apns, watcher, adapter."""
 
+import json as _json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
+from plugins.platforms.companion.apns import APNsSender
 from plugins.platforms.companion.devices import DeviceStore
 
 
@@ -130,3 +133,110 @@ class TestDeviceStore:
         path = tmp_path / "devices.json"
         _, token = DeviceStore(path).claim("iphone-do-mike", approved=True)
         assert DeviceStore(path).verify(token) == "iphone-do-mike"
+
+
+# Chave P-256 de teste. Não é a chave de produção e não abre nada:
+# é gerada só para o JWT deste teste.
+TEST_P8 = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G
+-----END PRIVATE KEY-----
+"""
+
+
+def _credentials_dir(tmp_path):
+    directory = tmp_path / "companion"
+    directory.mkdir()
+    (directory / "apns.p8").write_text(TEST_P8)
+    (directory / "apns.json").write_text(_json.dumps({"keyID": "ABCD123456", "teamID": "TEAM123456"}))
+    return directory
+
+
+class TestAPNsSender:
+    def test_unavailable_without_credentials(self, tmp_path):
+        assert APNsSender(tmp_path / "vazio").available() is False
+
+    def test_available_with_credentials(self, tmp_path):
+        assert APNsSender(_credentials_dir(tmp_path)).available() is True
+
+    def test_send_builds_the_expected_headers_and_payload(self, tmp_path):
+        captured = {}
+
+        def fake_runner(argv, **kwargs):
+            captured["argv"] = argv
+            captured["config"] = kwargs.get("input") or ""
+            # O corpo vai num arquivo referenciado por `data-binary = "@..."`.
+            for line in captured["config"].splitlines():
+                if line.startswith("data-binary"):
+                    body_path = line.split("@", 1)[1].strip('"')
+                    captured["body"] = _json.loads(open(body_path).read())
+            headers_path = argv[argv.index("-D") + 1]
+            open(headers_path, "w").write("HTTP/2 200\r\n\r\n")
+            return subprocess.CompletedProcess(argv, 0)
+
+        sender = APNsSender(_credentials_dir(tmp_path), runner=fake_runner)
+        status = sender.send_alert(
+            device_token="ab" * 32,
+            environment="production",
+            title="Aura",
+            body="Saldo atualizado",
+            session_id="api_1786900000_ab12cd",
+            message_id="422755",
+        )
+
+        assert status == 200
+        assert "--http2" in captured["argv"]
+        config = captured["config"]
+        assert 'header = "apns-topic: dev.meevi.n"' in config
+        assert 'header = "apns-push-type: alert"' in config
+        assert 'header = "apns-priority: 10"' in config
+        assert 'header = "apns-collapse-id: n-msg-api_1786900000_ab12cd"' in config
+        assert "api.push.apple.com" in config
+
+        body = captured["body"]
+        assert body["aps"]["alert"] == {"title": "Aura", "body": "Saldo atualizado"}
+        assert body["aps"]["thread-id"] == "api_1786900000_ab12cd"
+        assert body["kind"] == "message"
+        assert body["session_id"] == "api_1786900000_ab12cd"
+        assert body["message_id"] == "422755"
+        # Sem NSE no app: mutable-content é bandeira sem consumidor.
+        assert "mutable-content" not in body["aps"]
+        assert "badge" not in body["aps"]
+
+    def test_sandbox_environment_uses_the_sandbox_host(self, tmp_path):
+        captured = {}
+
+        def fake_runner(argv, **kwargs):
+            captured["config"] = kwargs.get("input") or ""
+            headers_path = argv[argv.index("-D") + 1]
+            open(headers_path, "w").write("HTTP/2 200\r\n\r\n")
+            return subprocess.CompletedProcess(argv, 0)
+
+        APNsSender(_credentials_dir(tmp_path), runner=fake_runner).send_alert(
+            device_token="ab" * 32, environment="sandbox",
+            title="t", body="b", session_id="s", message_id="1",
+        )
+        assert "api.sandbox.push.apple.com" in captured["config"]
+
+    def test_410_is_reported_so_the_caller_can_drop_the_device(self, tmp_path):
+        def fake_runner(argv, **kwargs):
+            headers_path = argv[argv.index("-D") + 1]
+            open(headers_path, "w").write("HTTP/2 410\r\n\r\n")
+            return subprocess.CompletedProcess(argv, 0)
+
+        status = APNsSender(_credentials_dir(tmp_path), runner=fake_runner).send_alert(
+            device_token="ab" * 32, environment="production",
+            title="t", body="b", session_id="s", message_id="1",
+        )
+        assert status == 410
+
+    def test_curl_failure_reports_zero_not_success(self, tmp_path):
+        def fake_runner(argv, **kwargs):
+            raise OSError("curl sumiu")
+
+        status = APNsSender(_credentials_dir(tmp_path), runner=fake_runner).send_alert(
+            device_token="ab" * 32, environment="production",
+            title="t", body="b", session_id="s", message_id="1",
+        )
+        assert status == 0
