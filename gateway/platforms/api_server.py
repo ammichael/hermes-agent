@@ -3332,6 +3332,28 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return {key: message.get(key) for key in safe_keys if key in message}
 
+    @staticmethod
+    def _resolve_history_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Inline ``MEDIA:`` tags on assistant history rows, like the chat paths do.
+
+        ``_handle_session_chat`` and ``_handle_session_chat_stream`` already run
+        ``_resolve_media_to_data_urls`` over the final response, so a remote
+        client sees the image the first time.  Re-opening the conversation went
+        through ``_handle_session_messages``, which did not — the client got the
+        raw ``MEDIA:<path>`` tag back and the picture disappeared.
+
+        Only ``assistant`` rows: a ``user`` row carrying ``MEDIA:`` is the echo of
+        what the caller itself uploaded and was already resolved on the way in, so
+        re-inlining it would double the bytes of the response for nothing.
+        """
+        for row in messages or []:
+            if not isinstance(row, dict) or row.get("role") != "assistant":
+                continue
+            content = row.get("content")
+            if isinstance(content, str) and "MEDIA:" in content:
+                row["content"] = _resolve_media_to_data_urls(content)
+        return messages
+
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
             body = await request.json()
@@ -3627,6 +3649,11 @@ class APIServerAdapter(BasePlatformAdapter):
             offset=offset,
             latest=latest_page,
         )
+        # Off the event loop: resolving media reads and base64-encodes files of up
+        # to _MEDIA_DATA_URL_MAX_BYTES each, and a page holds up to 500 rows. Doing
+        # that inline would freeze every in-flight request, same reason the SQLite
+        # reads above are offloaded.
+        messages = await asyncio.to_thread(self._resolve_history_media, messages)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
