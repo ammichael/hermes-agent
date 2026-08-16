@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 from plugins.platforms.companion.apns import APNsSender
 from plugins.platforms.companion.devices import DeviceStore
+from plugins.platforms.companion.watcher import MessageWatcher, ensure_trigger
 
 
 def _make_sessions_db(path: Path, rows):
@@ -240,3 +241,131 @@ class TestAPNsSender:
             title="t", body="b", session_id="s", message_id="1",
         )
         assert status == 0
+
+
+def _make_state_db(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, display_name TEXT);
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, timestamp REAL
+        );
+        CREATE TABLE gateway_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT, session_id TEXT, message_id INTEGER, timestamp REAL
+        );
+        """
+    )
+    ensure_trigger(conn)
+    conn.commit()
+    return conn
+
+
+def _insert(conn, session_id, role, content):
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,0)",
+        (session_id, role, content),
+    )
+    conn.commit()
+
+
+class TestMessageWatcher:
+    def test_only_assistant_rows_in_companion_sessions_are_pending(self, tmp_path):
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-api', 'api_server', 'Robô')")
+        conn.commit()
+
+        watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
+        watcher.bootstrap()
+
+        _insert(conn, "s-app", "assistant", "Saldo atualizado")
+        _insert(conn, "s-app", "user", "e o saldo?")       # eco: não notifica
+        _insert(conn, "s-api", "assistant", "resposta de API")  # outra origem
+
+        pending = watcher.pending()
+
+        assert [p.session_id for p in pending] == ["s-app"]
+        assert pending[0].preview == "Saldo atualizado"
+        assert pending[0].title == "Aura"
+
+    def test_bootstrap_does_not_replay_history(self, tmp_path):
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+        for i in range(5):
+            _insert(conn, "s-app", "assistant", f"antiga {i}")
+
+        watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
+        watcher.bootstrap()
+
+        assert watcher.pending() == []
+
+    def test_commit_advances_the_cursor_and_survives_a_new_instance(self, tmp_path):
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+
+        cursor_path = tmp_path / "cursor.json"
+        watcher = MessageWatcher(str(db), cursor_path)
+        watcher.bootstrap()
+        _insert(conn, "s-app", "assistant", "primeira")
+        _insert(conn, "s-app", "assistant", "segunda")
+
+        pending = watcher.pending()
+        assert len(pending) == 2
+
+        watcher.commit(pending[0].event_id)
+
+        # Só a segunda continua pendente, e isso sobrevive a um processo novo.
+        assert [p.preview for p in MessageWatcher(str(db), cursor_path).pending()] == ["segunda"]
+
+    def test_pending_alone_does_not_advance_the_cursor(self, tmp_path):
+        """Push perdido não tem conserto; push repetido tem (collapse-id).
+        Por isso o cursor só anda depois de a APNs aceitar."""
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+
+        watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
+        watcher.bootstrap()
+        _insert(conn, "s-app", "assistant", "uma só")
+
+        assert len(watcher.pending()) == 1
+        assert len(watcher.pending()) == 1  # sem commit, continua pendente
+
+    def test_ensure_trigger_is_idempotent_and_recreates_when_missing(self, tmp_path):
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("DROP TRIGGER gateway_event_message_created")
+        conn.commit()
+
+        ensure_trigger(conn)
+        ensure_trigger(conn)  # duas vezes não pode explodir
+
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+        _insert(conn, "s-app", "assistant", "depois de recriar")
+
+        count = conn.execute(
+            "SELECT COUNT(*) FROM gateway_events WHERE type='message.created'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_preview_is_truncated(self, tmp_path):
+        db = tmp_path / "state.db"
+        conn = _make_state_db(db)
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+
+        watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
+        watcher.bootstrap()
+        _insert(conn, "s-app", "assistant", "x" * 500)
+
+        assert len(watcher.pending()[0].preview) <= 180
