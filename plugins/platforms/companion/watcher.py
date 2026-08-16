@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 PREVIEW_MAX_CHARS = 180
@@ -32,8 +33,13 @@ AFTER INSERT ON messages BEGIN
 END;
 """
 
+# `title` primeiro, `display_name` como reserva: no banco real desta máquina são
+# 3315 sessões com `title` e 635 com `display_name`, e o `api_server` — que é
+# quem cria as conversas do Companion — nunca escreve `display_name`. Ler só a
+# segunda coluna dava "N" como título em quase toda notificação.
 PENDING_SQL = """
-SELECT e.id, e.session_id, e.message_id, s.display_name, m.content
+SELECT e.id, e.session_id, e.message_id,
+       COALESCE(NULLIF(s.title, ''), NULLIF(s.display_name, '')), m.content
   FROM gateway_events e
   JOIN messages  m ON m.id = e.message_id
   JOIN sessions  s ON s.id = e.session_id
@@ -60,8 +66,28 @@ def ensure_trigger(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# `MEDIA:/Users/mike/.hermes/cache/images/x.png` e
+# `[Image attached at: /Users/…]` são as duas convenções de mídia do Hermes, e
+# as duas carregam um caminho absoluto do disco do Mac. A resolução para data
+# URL acontece nas rotas de chat e no histórico — **não** aqui: o watcher lê a
+# linha crua de `messages`. Sem esta limpeza, toda resposta com imagem vira uma
+# notificação com o layout do `HERMES_HOME` estampado na tela de bloqueio, que
+# um push nem exige desbloquear para ler.
+_MEDIA_TAG_RE = re.compile(r"MEDIA:\s*(\S+)", re.IGNORECASE)
+_IMAGE_ATTACHED_RE = re.compile(r"\[Image attached at:\s*([^\]\r\n]+)\]", re.IGNORECASE)
+
+
+def _collapse_paths(text: str) -> str:
+    def _name(match: "re.Match[str]") -> str:
+        leaf = PurePosixPath(match.group(1).strip().strip("\"'`")).name
+        return f"📎 {leaf}" if leaf else "📎 Imagem"
+
+    text = _IMAGE_ATTACHED_RE.sub(_name, text)
+    return _MEDIA_TAG_RE.sub(_name, text)
+
+
 def _preview(content: Optional[str]) -> str:
-    text = " ".join(str(content or "").split())
+    text = " ".join(_collapse_paths(str(content or "")).split())
     if len(text) <= PREVIEW_MAX_CHARS:
         return text
     return text[: PREVIEW_MAX_CHARS - 1] + "…"

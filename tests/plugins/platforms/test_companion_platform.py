@@ -249,7 +249,7 @@ def _make_state_db(path):
     conn = sqlite3.connect(path)
     conn.executescript(
         """
-        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, display_name TEXT);
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, display_name TEXT);
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT, content TEXT, timestamp REAL
@@ -277,8 +277,8 @@ class TestMessageWatcher:
     def test_only_assistant_rows_in_companion_sessions_are_pending(self, tmp_path):
         db = tmp_path / "state.db"
         conn = _make_state_db(db)
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
-        conn.execute("INSERT INTO sessions VALUES ('s-api', 'api_server', 'Robô')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
+        conn.execute("INSERT INTO sessions VALUES ('s-api', 'api_server', 'Robô', NULL)")
         conn.commit()
 
         watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
@@ -297,7 +297,7 @@ class TestMessageWatcher:
     def test_bootstrap_does_not_replay_history(self, tmp_path):
         db = tmp_path / "state.db"
         conn = _make_state_db(db)
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
         for i in range(5):
             _insert(conn, "s-app", "assistant", f"antiga {i}")
@@ -310,7 +310,7 @@ class TestMessageWatcher:
     def test_commit_advances_the_cursor_and_survives_a_new_instance(self, tmp_path):
         db = tmp_path / "state.db"
         conn = _make_state_db(db)
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
 
         cursor_path = tmp_path / "cursor.json"
@@ -332,7 +332,7 @@ class TestMessageWatcher:
         Por isso o cursor só anda depois de a APNs aceitar."""
         db = tmp_path / "state.db"
         conn = _make_state_db(db)
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
 
         watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
@@ -351,7 +351,7 @@ class TestMessageWatcher:
         ensure_trigger(conn)
         ensure_trigger(conn)  # duas vezes não pode explodir
 
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
         _insert(conn, "s-app", "assistant", "depois de recriar")
 
@@ -363,7 +363,7 @@ class TestMessageWatcher:
     def test_preview_is_truncated(self, tmp_path):
         db = tmp_path / "state.db"
         conn = _make_state_db(db)
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
 
         watcher = MessageWatcher(str(db), tmp_path / "cursor.json")
@@ -412,6 +412,27 @@ def _dispatch(adapter, payload):
     return asyncio.run(adapter.dispatch_http_event(payload))
 
 
+def _verify(adapter, header):
+    return asyncio.run(adapter.verify_http_event_request(header))
+
+
+def _request(adapter, header, payload):
+    """Uma requisicao inteira: verify e dispatch na MESMA task.
+
+    E assim que o `api_server` faz (`api_server.py:1909` e `:1946`), e e a
+    unica forma de exercitar a ponte entre os dois. Rodar cada um em seu
+    proprio `asyncio.run` daria contextos diferentes e o dispatch nunca veria
+    o aparelho autenticado — que e exatamente o bug que o ContextVar conserta.
+    """
+    async def _run():
+        ok, code = await adapter.verify_http_event_request(header)
+        if not ok:
+            return {"ok": False, "error": code}
+        return await adapter.dispatch_http_event(payload)
+
+    return asyncio.run(_run())
+
+
 class TestCompanionControlPlane:
     def test_pair_request_returns_a_code(self, tmp_path):
         adapter = _adapter(tmp_path)
@@ -444,9 +465,8 @@ class TestCompanionControlPlane:
     def test_push_register_requires_a_paired_device(self, tmp_path):
         adapter = _adapter(tmp_path)
         issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
-        adapter._authenticated_device = adapter._devices.verify(issued["token"])
 
-        ok = _dispatch(adapter, {
+        ok = _request(adapter, f"Bearer {issued['token']}", {
             "type": "push.register",
             "apns_token": "ab" * 32,
             "environment": "production",
@@ -461,7 +481,7 @@ class TestCompanionControlPlane:
         quem barra `push.register` sem credencial é o dispatch."""
         adapter = _adapter(tmp_path)
         _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
-        adapter.verify_http_event_request("")
+        _verify(adapter, "")
 
         result = _dispatch(adapter, {
             "type": "push.register",
@@ -483,9 +503,8 @@ class TestCompanionVerifier:
     def test_verifier_accepts_the_issued_token(self, tmp_path):
         adapter = _adapter(tmp_path)
         issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
-        ok, _code = adapter.verify_http_event_request(f"Bearer {issued['token']}")
+        ok, _code = _verify(adapter, f"Bearer {issued['token']}")
         assert ok is True
-        assert adapter._authenticated_device == "iphone-do-mike"
 
     def test_verifier_refuses_a_revoked_device(self, tmp_path):
         """Revogação é imediata porque `is_approved` é conferido a cada evento."""
@@ -502,19 +521,18 @@ class TestCompanionVerifier:
                 return "ABCD1234"
 
         adapter._pairing = RevokingPairing()
-        assert adapter.verify_http_event_request(f"Bearer {issued['token']}")[0] is True
+        assert _verify(adapter, f"Bearer {issued['token']}")[0] is True
 
         revoked.add("iphone-do-mike")
-        ok, code = adapter.verify_http_event_request(f"Bearer {issued['token']}")
+        ok, code = _verify(adapter, f"Bearer {issued['token']}")
         assert ok is False
         assert code == "device_not_approved"
 
     def test_verifier_refuses_a_presented_credential_that_is_garbage(self, tmp_path):
         adapter = _adapter(tmp_path)
         for header in ["Bearer ", "Bearer nao-existe", "Basic abc"]:
-            ok, _ = adapter.verify_http_event_request(header)
+            ok, _ = _verify(adapter, header)
             assert ok is False, header
-            assert adapter._authenticated_device is None
 
     def test_absent_header_is_anonymous_not_refused(self, tmp_path):
         """A rota roda o verificador ANTES de olhar o corpo
@@ -524,10 +542,9 @@ class TestCompanionVerifier:
         credencial que estaria sendo exigida. Anônimo entra; o dispatch é quem
         decide o que o anônimo pode."""
         adapter = _adapter(tmp_path)
-        ok, code = adapter.verify_http_event_request("")
+        ok, code = _verify(adapter, "")
         assert ok is True
         assert code == ""
-        assert adapter._authenticated_device is None
 
     def test_pair_types_are_reachable_without_a_token(self, tmp_path):
         """`pair.request` e `pair.claim` são o enrolamento: eles não podem
@@ -541,7 +558,7 @@ class TestCompanionVerifier:
 class TestCompanionPushDrain:
     def _state_db(self, tmp_path):
         conn = _make_state_db(tmp_path / "state.db")
-        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura', NULL)")
         conn.commit()
         return conn
 
@@ -653,3 +670,59 @@ class TestCompanionOutbound:
 
         assert result.success is False
         assert result.error == "unknown_session"
+
+
+class TestCompanionAuthIsolation:
+    """A credencial pertence à requisição, nunca ao adapter.
+
+    O `api_server` chama `verify_http_event_request` e depois
+    `dispatch_http_event` sem nenhum parâmetro ligando um ao outro, e o aiohttp
+    atende requisições concorrentes no mesmo event loop. Guardar o aparelho
+    autenticado num atributo da instância fazia um anônimo que entrasse entre o
+    verify e o dispatch de um aparelho pareado herdar a credencial dele.
+    """
+
+    def test_anonymous_request_interleaved_with_an_authenticated_one_stays_anonymous(
+        self, tmp_path
+    ):
+        adapter = _adapter(tmp_path)
+        issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        token = issued["token"]
+
+        async def scenario():
+            barrier = asyncio.Event()
+
+            async def paired():
+                ok, _ = await adapter.verify_http_event_request(f"Bearer {token}")
+                assert ok is True
+                # O anônimo roda inteiro entre o verify e o dispatch deste.
+                barrier.set()
+                await asyncio.sleep(0.05)
+                return await adapter.dispatch_http_event({
+                    "type": "push.register",
+                    "apns_token": "ab" * 32,
+                    "environment": "production",
+                })
+
+            async def anonymous():
+                await barrier.wait()
+                ok, _ = await adapter.verify_http_event_request("")
+                assert ok is True  # anônimo entra; o dispatch é quem barra
+                return await adapter.dispatch_http_event({
+                    "type": "push.register",
+                    "apns_token": "cd" * 32,
+                    "environment": "production",
+                })
+
+            return await asyncio.gather(paired(), anonymous())
+
+        paired_result, anonymous_result = asyncio.run(scenario())
+
+        # O anônimo nao pode ter registrado nada...
+        assert anonymous_result["ok"] is False
+        assert anonymous_result["error"] == "unauthenticated"
+        # ...e o pareado nao pode ter perdido a credencial dele no caminho.
+        assert paired_result["ok"] is True
+        assert adapter._devices.push_targets() == [
+            ("iphone-do-mike", "ab" * 32, "production")
+        ]

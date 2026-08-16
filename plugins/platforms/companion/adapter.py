@@ -14,6 +14,7 @@ Sem socket de entrada: as mensagens continuam chegando pelas rotas de sessão do
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,6 +37,26 @@ UNAUTHENTICATED_TYPES = frozenset({"pair.request", "pair.claim"})
 # credencial. Um tipo novo entra exigindo credencial por padrão.
 KNOWN_TYPES = frozenset({"pair.request", "pair.claim", "push.register"})
 
+# O aparelho autenticado pertence à REQUISIÇÃO, nunca ao adapter.
+#
+# O `api_server` chama `verify_http_event_request` e, em seguida,
+# `dispatch_http_event` — dois awaits na mesma task, sem nenhum parâmetro que
+# ligue um ao outro. Guardar o resultado em `self._authenticated_device` parecia
+# a ponte óbvia e é um bypass: o aiohttp atende requisições concorrentes no
+# mesmo event loop, então basta um anônimo entrar entre o `verify` e o
+# `dispatch` de um aparelho autenticado para o anônimo herdar a credencial dele.
+# Um `ContextVar` é a ponte correta: ele é por task, e uma task não vê o valor
+# da outra.
+#
+# É por isto também que `verify_http_event_request` é `async`: o handler só
+# executa o verificador no event loop quando ele é corrotina
+# (`api_server.py:1909-1914`); sendo síncrono, ele vai para `asyncio.to_thread`,
+# e o contexto copiado para a thread é descartado no retorno — o valor gravado
+# lá nunca chegaria ao `dispatch`.
+_authenticated_device: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "companion_authenticated_device", default=None
+)
+
 
 class CompanionAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
@@ -53,7 +74,6 @@ class CompanionAdapter(BasePlatformAdapter):
         self._apns = APNsSender(companion_dir)
         self._watcher = MessageWatcher(self._state_db, companion_dir / "push-cursor.json")
         self._pairing = None  # resolvido em connect(); injetável em teste
-        self._authenticated_device: Optional[str] = None
         self._poll_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------- ciclo de vida
@@ -221,7 +241,7 @@ class CompanionAdapter(BasePlatformAdapter):
     def requires_credential(event_type: str) -> bool:
         return event_type not in UNAUTHENTICATED_TYPES
 
-    def verify_http_event_request(self, auth_header: str) -> tuple[bool, str]:
+    async def verify_http_event_request(self, auth_header: str) -> tuple[bool, str]:
         """Chamado pelo api_server antes de `dispatch_http_event`.
 
         Um verificador que levanta exceção faz o handler recusar o evento
@@ -236,7 +256,7 @@ class CompanionAdapter(BasePlatformAdapter):
         PRESENTE e inválido continua sendo recusa: credencial apresentada e
         não reconhecida falha fechado.
         """
-        self._authenticated_device = None
+        _authenticated_device.set(None)
         header = str(auth_header or "").strip()
         if not header:
             return (True, "")
@@ -256,12 +276,12 @@ class CompanionAdapter(BasePlatformAdapter):
             return (False, "pairing_unavailable")
         if not approved:
             return (False, "device_not_approved")
-        self._authenticated_device = device_id
+        _authenticated_device.set(device_id)
         return (True, "")
 
     async def dispatch_http_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         event_type = str(payload.get("type") or "")
-        device = self._authenticated_device
+        device = _authenticated_device.get()
         if event_type not in KNOWN_TYPES:
             return {"ok": False, "error": "unknown_type"}
         if self.requires_credential(event_type) and not device:
