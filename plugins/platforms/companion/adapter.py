@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import fcntl
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -75,6 +77,8 @@ class CompanionAdapter(BasePlatformAdapter):
         self._watcher = MessageWatcher(self._state_db, companion_dir / "push-cursor.json")
         self._pairing = None  # resolvido em connect(); injetável em teste
         self._poll_task: Optional[asyncio.Task] = None
+        self._lock_path = companion_dir / "push-poller.lock"
+        self._lock_fd: Optional[int] = None
 
     # ------------------------------------------------------- ciclo de vida
 
@@ -86,9 +90,53 @@ class CompanionAdapter(BasePlatformAdapter):
             logger.error("[companion] APNs credentials missing; platform will not start")
             return False
         self._watcher.bootstrap()
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        # Um poller só, por mais instâncias que existam.
+        #
+        # Medido nesta máquina: o gateway sobe a plataforma uma vez por profile
+        # — "companion connected" cinco vezes no log (default, finaya, nfo,
+        # product-loop-a2a-client, tibiaura). Nenhuma delas é ciente de profile,
+        # então as cinco compartilham o mesmo push-cursor.json e o mesmo
+        # devices.json. Sem esta trava, uma mensagem vira cinco pushes (o
+        # apns-collapse-id esconde isso na tela, o que é pior: o desperdício não
+        # aparece) e o cursor sofre corrida de leitura-modificação-escrita, que
+        # pode PULAR um evento — e evento pulado é notificação que nunca chega.
+        #
+        # `flock` é por descritor aberto, então dois `open()` no mesmo processo
+        # também disputam: serve tanto para os profiles quanto para um segundo
+        # gateway subindo em paralelo.
+        if self._acquire_poll_lock():
+            self._poll_task = asyncio.create_task(self._poll_loop())
+        else:
+            logger.info("[companion] another instance owns the push poller; serving control plane only")
         self._running = True
         return True
+
+    def _acquire_poll_lock(self) -> bool:
+        try:
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._lock_path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                os.close(fd)
+            except (OSError, NameError, UnboundLocalError):
+                pass
+            return False
+        self._lock_fd = fd
+        return True
+
+    def _release_poll_lock(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     async def disconnect(self) -> None:
         self._running = False
@@ -99,6 +147,7 @@ class CompanionAdapter(BasePlatformAdapter):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._release_poll_lock()
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"id": chat_id, "type": "dm", "platform": "companion"}

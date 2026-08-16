@@ -726,3 +726,22 @@ class TestCompanionAuthIsolation:
         assert adapter._devices.push_targets() == [
             ("iphone-do-mike", "ab" * 32, "production")
         ]
+
+
+class TestSinglePoller:
+    """O gateway sobe a plataforma uma vez por profile — cinco nesta máquina —
+    e nenhuma instância é ciente de profile. Sem trava, uma mensagem vira cinco
+    pushes e o cursor sofre corrida."""
+
+    def test_only_the_first_instance_gets_the_poll_lock(self, tmp_path):
+        first = _adapter(tmp_path)
+        second = _adapter(tmp_path)
+
+        assert first._acquire_poll_lock() is True
+        assert second._acquire_poll_lock() is False
+
+        # Quem solta devolve a vez, senão um restart parcial deixaria o push
+        # morto até o processo inteiro cair.
+        first._release_poll_lock()
+        assert second._acquire_poll_lock() is True
+        second._release_poll_lock()
