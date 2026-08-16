@@ -1,0 +1,12 @@
+name: companion-platform
+label: Companion
+kind: platform
+version: 1.0.0
+description: >
+  O app Apple do N (iPhone e Mac) como plataforma do Hermes. Não abre socket de
+  entrada: as mensagens continuam chegando pelas rotas de sessão do api_server.
+  O adapter existe para o caminho de saída — push APNs quando chega mensagem
+  nova numa conversa do app — e para o plano de controle do aparelho
+  (pareamento e registro de device token) via
+  POST /api/platforms/companion/events.
+author: mike

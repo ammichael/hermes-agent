@@ -1,5 +1,6 @@
 """Plugin de plataforma companion: backfill, devices, apns, watcher, adapter."""
 
+import asyncio
 import json as _json
 import os
 import sqlite3
@@ -10,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
+from plugins.platforms.companion.adapter import CompanionAdapter
 from plugins.platforms.companion.apns import APNsSender
 from plugins.platforms.companion.devices import DeviceStore
 from plugins.platforms.companion.watcher import MessageWatcher, ensure_trigger
@@ -369,3 +371,285 @@ class TestMessageWatcher:
         _insert(conn, "s-app", "assistant", "x" * 500)
 
         assert len(watcher.pending()[0].preview) <= 180
+
+
+# ---------------------------------------------------------------- adapter
+#
+# `dispatch_http_event` é async, e este venv NÃO tem `pytest-asyncio`
+# instalado — um `async def test_...` marcado com `@pytest.mark.asyncio` é
+# coletado, avisa "Unknown mark" e FALHA sem executar corpo nenhum
+# (confirmado em tests/test_model_tools_async_bridge.py). Por isso os testes
+# do adapter são síncronos e atravessam a fronteira async com `asyncio.run`.
+
+
+class _Config:
+    """PlatformConfig mínimo: o adapter só lê `extra`."""
+
+    def __init__(self, **extra):
+        self.extra = extra
+        self.enabled = True
+
+
+def _adapter(tmp_path, *, approved=("iphone-do-mike",), sender=None):
+    class FakePairing:
+        def is_approved(self, platform, user_id):
+            return user_id in approved
+
+        def generate_code(self, platform, user_id, user_name=""):
+            return "ABCD1234"
+
+    adapter = CompanionAdapter(_Config(
+        companion_dir=str(tmp_path / "companion"),
+        state_db=str(tmp_path / "state.db"),
+    ))
+    adapter._pairing = FakePairing()
+    if sender is not None:
+        adapter._apns = sender
+    return adapter
+
+
+def _dispatch(adapter, payload):
+    return asyncio.run(adapter.dispatch_http_event(payload))
+
+
+class TestCompanionControlPlane:
+    def test_pair_request_returns_a_code(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        result = _dispatch(adapter, {
+            "type": "pair.request",
+            "device_id": "iphone-do-mike",
+            "device_name": "iPhone do Mike",
+        })
+        assert result["status"] == "pending"
+        assert result["code"] == "ABCD1234"
+
+    def test_pair_claim_issues_once(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        first = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        assert first["status"] == "issued"
+        assert first["token"]
+
+        second = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        assert second["status"] == "already_claimed"
+        assert "token" not in second
+
+    def test_pair_claim_without_approval_issues_nothing(self, tmp_path):
+        adapter = _adapter(tmp_path, approved=())
+        result = _dispatch(
+            adapter, {"type": "pair.claim", "device_id": "iphone-nao-aprovado"}
+        )
+        assert result["status"] == "pending"
+        assert "token" not in result
+
+    def test_push_register_requires_a_paired_device(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        adapter._authenticated_device = adapter._devices.verify(issued["token"])
+
+        ok = _dispatch(adapter, {
+            "type": "push.register",
+            "apns_token": "ab" * 32,
+            "environment": "production",
+        })
+        assert ok["ok"] is True
+        assert adapter._devices.push_targets() == [
+            ("iphone-do-mike", "ab" * 32, "production")
+        ]
+
+    def test_push_register_without_credential_registers_nothing(self, tmp_path):
+        """O anônimo alcança o dispatch (o enrolamento precisa disso), então
+        quem barra `push.register` sem credencial é o dispatch."""
+        adapter = _adapter(tmp_path)
+        _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        adapter.verify_http_event_request("")
+
+        result = _dispatch(adapter, {
+            "type": "push.register",
+            "apns_token": "ab" * 32,
+            "environment": "production",
+        })
+        assert result["ok"] is False
+        assert result["error"] == "unauthenticated"
+        assert adapter._devices.push_targets() == []
+
+    def test_unknown_type_is_refused(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        result = _dispatch(adapter, {"type": "delete.everything"})
+        assert result["ok"] is False
+        assert result["error"] == "unknown_type"
+
+
+class TestCompanionVerifier:
+    def test_verifier_accepts_the_issued_token(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+        ok, _code = adapter.verify_http_event_request(f"Bearer {issued['token']}")
+        assert ok is True
+        assert adapter._authenticated_device == "iphone-do-mike"
+
+    def test_verifier_refuses_a_revoked_device(self, tmp_path):
+        """Revogação é imediata porque `is_approved` é conferido a cada evento."""
+        revoked = set()
+
+        adapter = _adapter(tmp_path)
+        issued = _dispatch(adapter, {"type": "pair.claim", "device_id": "iphone-do-mike"})
+
+        class RevokingPairing:
+            def is_approved(self, platform, user_id):
+                return user_id not in revoked
+
+            def generate_code(self, platform, user_id, user_name=""):
+                return "ABCD1234"
+
+        adapter._pairing = RevokingPairing()
+        assert adapter.verify_http_event_request(f"Bearer {issued['token']}")[0] is True
+
+        revoked.add("iphone-do-mike")
+        ok, code = adapter.verify_http_event_request(f"Bearer {issued['token']}")
+        assert ok is False
+        assert code == "device_not_approved"
+
+    def test_verifier_refuses_a_presented_credential_that_is_garbage(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        for header in ["Bearer ", "Bearer nao-existe", "Basic abc"]:
+            ok, _ = adapter.verify_http_event_request(header)
+            assert ok is False, header
+            assert adapter._authenticated_device is None
+
+    def test_absent_header_is_anonymous_not_refused(self, tmp_path):
+        """A rota roda o verificador ANTES de olhar o corpo
+        (`gateway/platforms/api_server.py:1907-1928`), e um `False` vira 401
+        antes de o `type` ser lido. Recusar o pedido sem cabeçalho tornaria
+        `pair.request`/`pair.claim` inalcançáveis — o telefone ainda não tem a
+        credencial que estaria sendo exigida. Anônimo entra; o dispatch é quem
+        decide o que o anônimo pode."""
+        adapter = _adapter(tmp_path)
+        ok, code = adapter.verify_http_event_request("")
+        assert ok is True
+        assert code == ""
+        assert adapter._authenticated_device is None
+
+    def test_pair_types_are_reachable_without_a_token(self, tmp_path):
+        """`pair.request` e `pair.claim` são o enrolamento: eles não podem
+        exigir a credencial que ainda não existe."""
+        adapter = _adapter(tmp_path)
+        assert adapter.requires_credential("pair.request") is False
+        assert adapter.requires_credential("pair.claim") is False
+        assert adapter.requires_credential("push.register") is True
+
+
+class TestCompanionPushDrain:
+    def _state_db(self, tmp_path):
+        conn = _make_state_db(tmp_path / "state.db")
+        conn.execute("INSERT INTO sessions VALUES ('s-app', 'companion_ios', 'Aura')")
+        conn.commit()
+        return conn
+
+    def test_drain_sends_and_advances_the_cursor(self, tmp_path):
+        conn = self._state_db(tmp_path)
+        sent = []
+
+        class FakeSender:
+            def available(self):
+                return True
+
+            def send_alert(self, **kwargs):
+                sent.append(kwargs)
+                return 200
+
+        adapter = _adapter(tmp_path, sender=FakeSender())
+        adapter._devices.claim("iphone-do-mike", approved=True)
+        adapter._devices.register_push("iphone-do-mike", "ab" * 32, "production")
+        adapter._watcher.bootstrap()
+
+        _insert(conn, "s-app", "assistant", "Saldo atualizado")
+        adapter._drain_once()
+
+        assert [s["body"] for s in sent] == ["Saldo atualizado"]
+        assert sent[0]["title"] == "Aura"
+        assert sent[0]["session_id"] == "s-app"
+        assert adapter._watcher.pending() == []
+
+    def test_dead_token_is_dropped_and_the_cursor_still_moves(self, tmp_path):
+        conn = self._state_db(tmp_path)
+
+        class GoneSender:
+            def available(self):
+                return True
+
+            def send_alert(self, **kwargs):
+                return 410
+
+        adapter = _adapter(tmp_path, sender=GoneSender())
+        adapter._devices.claim("iphone-do-mike", approved=True)
+        adapter._devices.register_push("iphone-do-mike", "ab" * 32, "production")
+        adapter._watcher.bootstrap()
+
+        _insert(conn, "s-app", "assistant", "some")
+        adapter._drain_once()
+
+        assert adapter._devices.push_targets() == []
+        assert adapter._watcher.pending() == []
+
+    def test_a_refused_push_holds_the_cursor_for_the_next_poll(self, tmp_path):
+        conn = self._state_db(tmp_path)
+
+        class FailingSender:
+            def available(self):
+                return True
+
+            def send_alert(self, **kwargs):
+                return 500
+
+        adapter = _adapter(tmp_path, sender=FailingSender())
+        adapter._devices.claim("iphone-do-mike", approved=True)
+        adapter._devices.register_push("iphone-do-mike", "ab" * 32, "production")
+        adapter._watcher.bootstrap()
+
+        _insert(conn, "s-app", "assistant", "tenta de novo")
+        adapter._drain_once()
+
+        assert [p.preview for p in adapter._watcher.pending()] == ["tenta de novo"]
+
+
+class TestCompanionOutbound:
+    def test_image_becomes_a_media_line_na_conversa(self, tmp_path):
+        """O default da base (`base.py:4707`) manda "Couldn't deliver the image
+        attachment" e apaga o caminho. Aqui a linha `MEDIA:` tem de sobreviver:
+        é ela que o histórico resolve para data URL."""
+        adapter = _adapter(tmp_path)
+        written = []
+        adapter._append_to_session = (
+            lambda chat_id, content: written.append((chat_id, content)) or "412"
+        )
+
+        image = tmp_path / "grafico.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        result = asyncio.run(
+            adapter.send_image_file("s-app", str(image), caption="Segue o gráfico")
+        )
+
+        assert result.success is True
+        assert result.message_id == "412"
+        chat_id, content = written[0]
+        assert chat_id == "s-app"
+        assert content.startswith("Segue o gráfico\nMEDIA:")
+        assert content.endswith("grafico.png")
+
+    def test_unsafe_media_path_is_refused(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        result = asyncio.run(
+            adapter.send_image_file("s-app", str(tmp_path / "nao-existe.png"))
+        )
+        assert result.success is False
+        assert result.error == "unsafe_media_path"
+
+    def test_send_to_an_unknown_session_fails_loudly(self, tmp_path):
+        adapter = _adapter(tmp_path)
+        adapter._append_to_session = lambda chat_id, content: None
+
+        result = asyncio.run(adapter.send("s-inexistente", "oi"))
+
+        assert result.success is False
+        assert result.error == "unknown_session"
