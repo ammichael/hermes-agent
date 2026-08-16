@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import time
+from pathlib import Path
 
 import pytest
 
@@ -119,9 +120,35 @@ class TestSubprocessEnvironment:
 
         env = bu_cli._base_subprocess_env()
 
-        assert "PYTHONPATH" not in env
+        assert "/hermes/venv" not in (env.get("PYTHONPATH") or "")
+        assert env.get("PYTHONPATH") != "/hermes:/hermes/venv/lib/site-packages"
         assert "PYTHONHOME" not in env
         assert env["KEEP_ME"] == "yes"
+        overlay = Path(bu_cli.__file__).resolve().parent / "browser_harness_sitecustomize"
+        assert env["PYTHONPATH"] == str(overlay)
+
+
+def test_open_chrome_inspect_uses_arc_when_chrome_missing(monkeypatch):
+    import importlib.util
+
+    path = Path(bu_cli.__file__).resolve().parent / "browser_harness_sitecustomize" / "sitecustomize.py"
+    spec = importlib.util.spec_from_file_location("bh_sitecustomize", path)
+    overlay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        rc = 0 if cmd[:3] == ["open", "-a", "Arc"] else 1
+        return type("R", (), {"returncode": rc})()
+
+    monkeypatch.setattr(overlay.subprocess, "run", fake_run)
+    monkeypatch.setattr(overlay.platform, "system", lambda: "Darwin")
+    assert overlay._open_chrome_inspect() is True
+    assert calls[0] == ["open", "-a", "Google Chrome", "chrome://inspect/#remote-debugging"]
+    assert calls[1] == ["open", "-a", "Arc", "chrome://inspect/#remote-debugging"]
+    assert not any("osascript" in str(c) or "Safari" in str(c) for c in calls)
 
 
 class TestToolSurfaceSwap:

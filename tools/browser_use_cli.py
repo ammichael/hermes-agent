@@ -118,6 +118,11 @@ def _base_subprocess_env() -> dict:
     # needs Hermes's import path.
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
+    # Isolated overlay only — never Hermes's venv. Survives uvx upgrades
+    # and stops chrome://inspect from opening Safari when Chrome is gone.
+    overlay = Path(__file__).resolve().parent / "browser_harness_sitecustomize"
+    if overlay.is_dir():
+        env["PYTHONPATH"] = str(overlay)
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     return env
 
