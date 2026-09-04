@@ -15,6 +15,7 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import {
   buildPollPayload,
   buildTextSendPayload,
+  buildReactionPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
   extractBridgeEvent,
@@ -409,6 +410,22 @@ import {
   assert.equal(event.body, 'see attached\n[document could not be downloaded]');
   assert.equal(event.mediaUrls.length, 0);
   console.log('  ✓ captioned failed download keeps caption and appends note');
+}
+
+// -- reactions --------------------------------------------------------------
+{
+  assert.deepEqual(
+    buildReactionPayload({ chatId: '1@lid', messageId: 'ABC', reaction: '✅' }),
+    { react: { text: '✅', key: { id: 'ABC', fromMe: true, remoteJid: '1@lid' } } },
+  );
+  const group = buildReactionPayload({
+    chatId: '1@g.us', messageId: 'ABC', reaction: '', fromMe: false, participant: '2@s.whatsapp.net',
+  });
+  assert.equal(group.react.text, '');
+  assert.equal(group.react.key.fromMe, false);
+  assert.equal(group.react.key.participant, '2@s.whatsapp.net');
+  assert.equal(buildReactionPayload({ chatId: '1@lid', messageId: 'ABC' }), null);
+  console.log('  ✓ reaction payload targets the message key');
 }
 
 console.log('\n✅ All WhatsApp native bridge helper tests passed.');

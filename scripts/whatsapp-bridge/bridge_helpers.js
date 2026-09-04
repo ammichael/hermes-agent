@@ -170,6 +170,15 @@ export function buildTextSendPayload(text, { replyTo, messageStore } = {}) {
   return { content, options };
 }
 
+export function buildReactionPayload({ chatId, messageId, reaction, fromMe = true, participant } = {}) {
+  if (!chatId || !messageId || typeof reaction !== 'string') return null;
+  // Baileys reacts by sending a `react` message that points at the target key.
+  // Empty `text` removes a previous reaction from this account.
+  const key = { id: messageId, fromMe: fromMe !== false, remoteJid: chatId };
+  if (participant) key.participant = participant;
+  return { react: { text: reaction, key } };
+}
+
 export function buildLocationPayload({ latitude, longitude, name, address } = {}) {
   const lat = Number(latitude);
   const lon = Number(longitude);

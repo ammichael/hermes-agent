@@ -39,6 +39,7 @@ import {
   createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
+  buildReactionPayload,
   createBoundedMessageStore,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -887,6 +888,25 @@ app.post('/edit', async (req, res) => {
     }
 
     res.json({ success: true, messageIds });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// React to a message with an emoji (empty reaction removes ours)
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const payload = buildReactionPayload(req.body || {});
+  if (!payload) {
+    return res.status(400).json({ error: 'chatId, messageId, and reaction are required' });
+  }
+
+  try {
+    await sendWithTimeout(req.body.chatId, payload);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
