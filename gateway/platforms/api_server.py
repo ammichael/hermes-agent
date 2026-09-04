@@ -141,6 +141,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_companion_reminders as _companion_reminder_routes
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -2263,6 +2264,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        routes.extend(_companion_reminder_routes._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
