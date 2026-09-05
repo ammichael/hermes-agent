@@ -278,3 +278,14 @@ class TestRouteRegistration:
             APIServerAdapter.__new__(APIServerAdapter)
         )}
         assert "/api/companion/reminders/{reminder_id}/action" in paths
+
+
+def test_today_executes_only_the_native_read_only_list_command(tmp_path, monkeypatch):
+    import asyncio
+    from gateway import companion_reminders as reminders
+    script = tmp_path / "list.py"
+    script.write_text('import sys, json\nassert sys.argv[1:] == ["list"]\nprint(json.dumps({"ok":True,"reminders":[]}))')
+    monkeypatch.setattr(reminders, "ACTION_SCRIPT", script)
+    assert asyncio.run(reminders.list_today())["reminders"] == []
+    argv = reminders.build_action_argv("test-only", "done", None, "instance", source="companion_app")
+    assert argv[argv.index("--source") + 1] == "companion_app"

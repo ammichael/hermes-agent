@@ -43,6 +43,7 @@ async def _handle_reminder_action(adapter, request: "web.Request") -> "web.Respo
         str(payload["kind"]),
         taken_at=payload.get("taken_at"),
         instance_key=payload.get("instance_key"),
+        source=payload.get("source", "live_activity"),
     )
     # 200 even when `ok` is false: a Hermes refusal is a valid verdict, not a
     # protocol error. The phone reads `ok` (and `retryable` on process death).
@@ -56,6 +57,14 @@ async def _handle_reminder_plans(adapter, request: "web.Request") -> "web.Respon
         return auth_err
     plans = await asyncio.to_thread(_companion_reminders.load_plans)
     return web.json_response({"plans": plans})
+
+
+async def _handle_reminders_today(adapter, request: "web.Request") -> "web.Response":
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+    result = await _companion_reminders.list_today()
+    return web.json_response(result, status=200 if result.get("ok") is True else 503)
 
 
 async def _handle_reminder_plan_ack(adapter, request: "web.Request") -> "web.Response":
@@ -97,6 +106,7 @@ async def _handle_activity_dismiss(adapter, request: "web.Request") -> "web.Resp
 _ROUTES: tuple[tuple[str, str, Callable[..., Awaitable[Any]]], ...] = (
     ("POST", "/api/companion/reminders/{reminder_id}/action", _handle_reminder_action),
     ("GET", "/api/companion/reminders/plans", _handle_reminder_plans),
+    ("GET", "/api/companion/reminders/today", _handle_reminders_today),
     ("POST", "/api/companion/reminders/plan-ack", _handle_reminder_plan_ack),
     ("POST", "/api/companion/live-activity/token", _handle_activity_token),
     ("POST", "/api/companion/live-activity/dismiss", _handle_activity_dismiss),

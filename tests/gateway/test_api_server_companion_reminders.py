@@ -28,11 +28,12 @@ def _adapter(auth_response=None):
     return SimpleNamespace(_check_auth=lambda request: auth_response)
 
 
-def test_route_table_exposes_the_five_phone_routes():
+def test_route_table_exposes_the_phone_routes():
     table = routes_mod._http_routes(_adapter())
     assert [(m, p) for m, p, _ in table] == [
         ("POST", "/api/companion/reminders/{reminder_id}/action"),
         ("GET", "/api/companion/reminders/plans"),
+        ("GET", "/api/companion/reminders/today"),
         ("POST", "/api/companion/reminders/plan-ack"),
         ("POST", "/api/companion/live-activity/token"),
         ("POST", "/api/companion/live-activity/dismiss"),
@@ -65,7 +66,7 @@ def test_action_verdict_is_returned_as_200_even_when_refused():
         ("POST", "/api/companion/reminders/{reminder_id}/action")
     ]
 
-    async def fake_run(reminder_id, kind, taken_at=None, instance_key=None):
+    async def fake_run(reminder_id, kind, taken_at=None, instance_key=None, source="live_activity"):
         return {"ok": False, "error": "stale_action", "retryable": False, "reminder_id": reminder_id}
 
     with patch.object(routes_mod._companion_reminders, "run_reminder_action", side_effect=fake_run):
@@ -76,3 +77,35 @@ def test_action_verdict_is_returned_as_200_even_when_refused():
         )
     assert response.status == 200
     assert json.loads(response.text) == {"ok": False, "error": "stale_action", "retryable": False, "reminder_id": "bedtime-lexa"}
+
+
+def test_today_is_authenticated_and_unavailability_is_not_an_empty_day():
+    sentinel = object()
+    with patch.object(routes_mod._companion_reminders, "list_today") as listing:
+        result = asyncio.run(routes_mod._handle_reminders_today(_adapter(sentinel), _Request(None)))
+        assert result is sentinel
+        listing.assert_not_called()
+    for body, status in [({"ok": True, "reminders": []}, 200),
+                         ({"ok": False, "error": "script_failed"}, 503)]:
+        async def fake_list():
+            return body
+        with patch.object(routes_mod._companion_reminders, "list_today", side_effect=fake_list):
+            response = asyncio.run(routes_mod._handle_reminders_today(_adapter(), _Request(None)))
+        assert response.status == status
+        assert json.loads(response.text) == body
+
+
+def test_action_source_is_preserved_and_privileged_sources_are_refused():
+    for source in ("api", "visual_evidence", ["companion_app"]):
+        with patch.object(routes_mod._companion_reminders, "run_reminder_action") as run:
+            response = asyncio.run(routes_mod._handle_reminder_action(
+                _adapter(), _Request({"kind": "done", "source": source}, {"reminder_id": "test-only"})))
+            assert response.status == 400
+            run.assert_not_called()
+    async def fake_run(reminder_id, kind, **kwargs):
+        assert kwargs["source"] == "companion_app"
+        return {"ok": True}
+    with patch.object(routes_mod._companion_reminders, "run_reminder_action", side_effect=fake_run):
+        response = asyncio.run(routes_mod._handle_reminder_action(
+            _adapter(), _Request({"kind": "done", "source": "companion_app"}, {"reminder_id": "test-only"})))
+        assert json.loads(response.text)["ok"] is True

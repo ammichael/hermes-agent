@@ -59,6 +59,7 @@ def build_action_argv(
     kind: str,
     taken_at: Optional[str],
     instance_key: Optional[str],
+    source: str = "live_activity",
 ) -> List[str]:
     """Argumentos como lista. Nunca uma string de shell, nunca ``shell=True``."""
     argv = [
@@ -68,7 +69,7 @@ def build_action_argv(
         "--id",
         reminder_id,
         "--source",
-        "live_activity",
+        source,
     ]
     if taken_at:
         argv += ["--taken-at", taken_at]
@@ -119,10 +120,16 @@ async def run_reminder_action(
     kind: str,
     taken_at: Optional[str] = None,
     instance_key: Optional[str] = None,
+    source: str = "live_activity",
 ) -> Dict[str, Any]:
     """Executa a ação fora do event loop — o script faz I/O de arquivo sob lock."""
-    argv = build_action_argv(reminder_id, kind, taken_at, instance_key)
+    argv = build_action_argv(reminder_id, kind, taken_at, instance_key, source)
     return await asyncio.to_thread(_run_blocking, argv)
+
+
+async def list_today() -> Dict[str, Any]:
+    """Use the native scheduler projection; never read or mutate a second schedule."""
+    return await asyncio.to_thread(_run_blocking, [sys.executable, str(ACTION_SCRIPT), "list"])
 
 
 def validate_action_request(
@@ -131,8 +138,11 @@ def validate_action_request(
     """Retorna a mensagem de erro, ou ``None`` quando a entrada serve."""
     if not REMINDER_ID_RE.match(reminder_id or ""):
         return "invalid_reminder_id"
+    source = payload.get("source", "live_activity")
+    if not isinstance(source, str) or source not in {"live_activity", "companion_app"}:
+        return "invalid_source"
     kind = payload.get("kind")
-    if kind not in VALID_KINDS:
+    if not isinstance(kind, str) or kind not in VALID_KINDS:
         return "invalid_kind"
     instance_key = payload.get("instance_key")
     if instance_key is not None and not INSTANCE_KEY_RE.match(str(instance_key)):
