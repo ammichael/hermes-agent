@@ -141,6 +141,11 @@ def validate_action_request(
     source = payload.get("source", "live_activity")
     if not isinstance(source, str) or source not in {"live_activity", "companion_app"}:
         return "invalid_source"
+    if source == "companion_app" and (
+        not isinstance(payload.get("taken_at"), str) or not payload["taken_at"]
+        or not isinstance(payload.get("instance_key"), str) or not payload["instance_key"]
+    ):
+        return "missing_action_context"
     kind = payload.get("kind")
     if not isinstance(kind, str) or kind not in VALID_KINDS:
         return "invalid_kind"

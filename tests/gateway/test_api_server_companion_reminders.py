@@ -107,5 +107,15 @@ def test_action_source_is_preserved_and_privileged_sources_are_refused():
         return {"ok": True}
     with patch.object(routes_mod._companion_reminders, "run_reminder_action", side_effect=fake_run):
         response = asyncio.run(routes_mod._handle_reminder_action(
-            _adapter(), _Request({"kind": "done", "source": "companion_app"}, {"reminder_id": "test-only"})))
+            _adapter(), _Request({"kind": "done", "source": "companion_app", "instance_key": "2026-09-05", "taken_at": "2026-09-05T12:00:00-03:00"}, {"reminder_id": "test-only"})))
         assert json.loads(response.text)["ok"] is True
+
+
+def test_app_action_requires_occurrence_and_timestamp_before_subprocess():
+    for body in ({"kind":"done", "source":"companion_app"},
+                 {"kind":"done", "source":"companion_app", "instance_key":"2026-09-05"},
+                 {"kind":"done", "source":"companion_app", "instance_key":"2026-09-05", "taken_at":[]}):
+        with patch.object(routes_mod._companion_reminders, "run_reminder_action") as run:
+            response = asyncio.run(routes_mod._handle_reminder_action(_adapter(), _Request(body, {"reminder_id":"test-only"})))
+            assert response.status == 400
+            run.assert_not_called()
