@@ -800,6 +800,54 @@ def _normalize_multimodal_content(content: Any) -> Any:
     return normalized_parts
 
 
+def _companion_image_metadata(content: Any) -> Optional[Dict[str, Any]]:
+    """Keep inline image presentation separate from the agent's replay summary.
+
+    Only the Companion session routes opt in. No remote URL fetch or local
+    file lookup; the existing request ceiling also bounds each durable row.
+    """
+    import base64
+    import binascii
+
+    if not isinstance(content, list) or len(content) > MAX_CONTENT_LIST_SIZE:
+        return None
+    rendered = []
+    size = 0
+    has_image = False
+    for part in content:
+        if not isinstance(part, dict):
+            return None
+        if part.get("type") == "text":
+            value = part.get("text")
+            if not isinstance(value, str):
+                return None
+        elif part.get("type") == "image_url":
+            ref = part.get("image_url")
+            url = ref.get("url") if isinstance(ref, dict) else None
+            if not isinstance(url, str) or len(url) > MAX_REQUEST_BYTES:
+                return None
+            header, sep, encoded = url.partition(",")
+            if not sep or header not in {
+                "data:image/jpeg;base64", "data:image/png;base64",
+                "data:image/gif;base64", "data:image/webp;base64",
+            }:
+                return None
+            try:
+                if not base64.b64decode(encoded, validate=True):
+                    return None
+            except (ValueError, binascii.Error):
+                return None
+            value = f"![image]({url})"
+            has_image = True
+        else:
+            return None
+        size += len(value.encode("utf-8")) + 1
+        if size > MAX_REQUEST_BYTES:
+            return None
+        rendered.append(value)
+    return {"companion_image_content": "\n".join(rendered)} if has_image else None
+
+
 def _content_has_visible_payload(content: Any) -> bool:
     """True when content has any text or image attachment.  Used to reject empty turns."""
     if isinstance(content, str):
@@ -4307,7 +4355,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
+        ordinary_user = (
+            message.get("role") == "user"
+            and not message.get("display_kind")
+            and not _is_compressed_summary_message(message)
+        )
         message = _project_client_message(message)
+        metadata = message.get("display_metadata")
+        if ordinary_user and isinstance(metadata, dict):
+            presentation = metadata.get("companion_image_content")
+            if isinstance(presentation, str) and len(presentation.encode("utf-8")) <= MAX_REQUEST_BYTES:
+                message["content"] = presentation
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
@@ -4829,6 +4887,8 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            user_display_metadata=(_companion_image_metadata(user_message)
+                                   if session.get("source") == "companion_ios" else None),
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -5007,6 +5067,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    user_display_metadata=(_companion_image_metadata(user_message)
+                                           if session.get("source") == "companion_ios" else None),
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -7435,6 +7497,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
         bind_declared_conversation: bool = False,
+        user_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7529,6 +7592,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
+                        **({"persist_user_display_metadata": user_display_metadata}
+                           if user_display_metadata else {}),
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

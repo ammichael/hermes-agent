@@ -834,8 +834,8 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
     # as metadata on the user turn so it survives the early crash-resilience

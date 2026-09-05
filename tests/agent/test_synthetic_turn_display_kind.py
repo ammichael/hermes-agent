@@ -104,3 +104,78 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_image_presentation_survives_early_persist_without_typing_user(agent_db):
+    from agent.codex_responses_adapter import _summarize_user_message_for_log
+    from gateway.platforms.api_server import APIServerAdapter, _companion_image_metadata
+
+    agent, db, sid = agent_db
+    url = "data:image/png;base64,aW1hZ2U="
+    content = [{"type": "text", "text": "read this"},
+               {"type": "image_url", "image_url": {"url": url}}]
+    _build(agent, user_message=content,
+           summarize_user_message_for_log=_summarize_user_message_for_log,
+           persist_user_display_metadata=_companion_image_metadata(content))
+
+    row, = [r for r in db.get_messages(sid) if r["role"] == "user"]
+    assert row.get("display_kind") is None
+    assert row["content"] == "read this\n[screenshot]"
+    assert APIServerAdapter._message_response(row)["content"] == f"read this\n![image]({url})"
+    replay, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert replay["content"] == row["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("source", ["companion_ios", "api_server"])
+async def test_image_http_turn_reopens_durable_history(agent_db, stream, source):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from agent.codex_responses_adapter import _summarize_user_message_for_log
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    agent, db, _ = agent_db
+    sid = "image-http-test"
+    db.create_session(session_id=sid, source=source, model="test-model")
+    agent.session_id = sid
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test"}))
+    adapter._session_db = db
+    adapter._create_agent = lambda **kwargs: agent
+    url = "data:image/png;base64,aW1hZ2U="
+    content = [{"type": "text", "text": "read this"},
+               {"type": "image_url", "image_url": {"url": url}}]
+
+    def run(**kwargs):
+        _build(agent, **kwargs, summarize_user_message_for_log=_summarize_user_message_for_log)
+        return {"final_response": "image received", "messages": [], "api_calls": 1}
+
+    agent.run_conversation = run
+    app = web.Application()
+    path = "/api/sessions/{session_id}"
+    app.router.add_post(path + "/chat", adapter._handle_session_chat)
+    app.router.add_post(path + "/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_get(path + "/messages", adapter._handle_session_messages)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            f"/api/sessions/{sid}/chat" + ("/stream" if stream else ""),
+            json={"message": content}, headers={"Authorization": "Bearer test"},
+        )
+        assert response.status == 200, await response.text()
+        result = await response.text()
+        assert "image received" in result
+        # A new DB connection rules out an in-memory transcript-only fix.
+        reopened = SessionDB(db.db_path)
+        adapter._session_db = reopened
+        try:
+            response = await client.get(f"/api/sessions/{sid}/messages",
+                                        headers={"Authorization": "Bearer test"})
+            assert response.status == 200
+            body = await response.json()
+            row, = [r for r in body["data"] if r["role"] == "user"]
+            expected = f"read this\n![image]({url})" if source == "companion_ios" else "read this\n[screenshot]"
+            assert row["content"] == expected
+            assert "display_metadata" not in row
+        finally:
+            reopened.close()

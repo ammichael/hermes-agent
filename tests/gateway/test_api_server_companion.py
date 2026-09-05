@@ -8,9 +8,37 @@ aparece como "o push parou" e "a imagem sumiu ao reabrir a conversa".
 import inspect
 import struct
 import zlib
+import pytest
 from pathlib import Path
 
 from gateway.platforms.api_server import APIServerAdapter, _resolve_media_to_data_urls
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "https://example.org/image.png",
+                                 "data:text/html;base64,YQ==", "data:image/png;base64,%%%"])
+def test_user_presentation_never_fetches_or_inlines_untrusted_urls(url):
+    from gateway.platforms.api_server import _companion_image_metadata
+
+    assert _companion_image_metadata([
+        {"type": "image_url", "image_url": {"url": url}}
+    ]) is None
+
+
+def test_user_presentation_is_bounded(monkeypatch):
+    import gateway.platforms.api_server as api
+
+    monkeypatch.setattr(api, "MAX_REQUEST_BYTES", 10)
+    assert api._companion_image_metadata([
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}}
+    ]) is None
+
+
+@pytest.mark.parametrize("role,kind", [("assistant", None), ("user", "hidden"),
+                                       ("user", "auto_continue")])
+def test_image_presentation_cannot_override_other_message_kinds(role, kind):
+    row = {"role": role, "content": "visible", "display_kind": kind,
+           "display_metadata": {"companion_image_content": "private image"}}
+    assert "private image" not in APIServerAdapter._message_response(row)["content"]
 
 
 class TestSessionSourceAllowlist:
