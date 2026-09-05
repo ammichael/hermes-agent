@@ -78,10 +78,20 @@ async def _handle_activity_token(adapter, request: "web.Request") -> "web.Respon
     payload = await _json_object(request)
     if payload is None:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
-    recorded = await asyncio.to_thread(
-        _companion_reminders.record_activity_token, str(payload.get("activity_token") or "")
-    )
-    return web.json_response({"ok": bool(recorded)})
+    if not _companion_reminders.valid_push_registration(payload):
+        return web.json_response({"ok": False, "error": "invalid_registration"}, status=400)
+    recorded = await asyncio.to_thread(_companion_reminders.record_push_registration, payload)
+    return web.json_response({"ok": bool(recorded)}, status=200 if recorded else 503)
+
+
+async def _handle_activity_dismiss(adapter, request: "web.Request") -> "web.Response":
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+    payload = await _json_object(request)
+    if payload is None or not _companion_reminders.valid_communication_id(payload.get("communication_id")):
+        return web.json_response({"ok": False, "error": "invalid_communication_id", "retryable": False}, status=400)
+    return web.json_response(await _companion_reminders.dismiss_communication(payload["communication_id"]))
 
 
 _ROUTES: tuple[tuple[str, str, Callable[..., Awaitable[Any]]], ...] = (
@@ -89,6 +99,7 @@ _ROUTES: tuple[tuple[str, str, Callable[..., Awaitable[Any]]], ...] = (
     ("GET", "/api/companion/reminders/plans", _handle_reminder_plans),
     ("POST", "/api/companion/reminders/plan-ack", _handle_reminder_plan_ack),
     ("POST", "/api/companion/live-activity/token", _handle_activity_token),
+    ("POST", "/api/companion/live-activity/dismiss", _handle_activity_dismiss),
 )
 
 

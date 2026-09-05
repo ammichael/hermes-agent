@@ -14,9 +14,12 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils import atomic_json_write
+from hermes_cli.auth import _file_lock
 from hermes_constants import get_default_hermes_root
 
 logger = logging.getLogger(__name__)
@@ -163,88 +166,135 @@ def load_plans(*, path: Path = STATE_PATH) -> List[Dict[str, Any]]:
 
 
 def record_plan_ack(ack: Dict[str, Any], *, path: Path = ACK_PATH) -> bool:
-    """``True`` quando gravou. Uma revisão que regride é ignorada, não é erro."""
+    """Accept a durable ACK, including one already covered by a newer/stronger ACK."""
     reminder_id = str(ack.get("reminder_id") or "")
     instance_key = str(ack.get("instance_key") or "")
     outcome = str(ack.get("outcome") or "")
-    try:
-        revision = int(ack.get("revision") or 0)
-    except (TypeError, ValueError):
+    revision = ack.get("revision")
+    if (not REMINDER_ID_RE.fullmatch(reminder_id) or not INSTANCE_KEY_RE.fullmatch(instance_key)
+            or type(revision) is not int or revision <= 0 or outcome not in _ACK_RANK):
         return False
-    if not reminder_id or not instance_key or revision <= 0 or outcome not in _ACK_RANK:
-        return False
-
     try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        stored = {}
-    key = f"{reminder_id}|{instance_key}"
-    existing = stored.get(key)
-    if isinstance(existing, dict):
-        existing_revision = int(existing.get("revision") or 0)
-        if revision < existing_revision:
-            return False
-        if revision == existing_revision and _ACK_RANK[outcome] < _ACK_RANK.get(
-            str(existing.get("outcome") or ""), 0
-        ):
-            return False
-
-    stored[key] = {
-        "reminder_id": reminder_id,
-        "instance_key": instance_key,
-        "revision": revision,
-        "outcome": outcome,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
-    return True
+        with _file_lock(path.with_suffix(".lock"), threading.local(), 5, "ACK store busy"):
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                stored = {}
+            if not isinstance(stored, dict):
+                return False
+            key = f"{reminder_id}|{instance_key}"
+            existing = stored.get(key)
+            if isinstance(existing, dict):
+                existing_revision = int(existing.get("revision") or 0)
+                if revision < existing_revision:
+                    return True
+                if revision == existing_revision and _ACK_RANK[outcome] <= _ACK_RANK.get(
+                    str(existing.get("outcome") or ""), 0
+                ):
+                    return True
+            stored[key] = {
+                "reminder_id": reminder_id, "instance_key": instance_key,
+                "revision": revision, "outcome": outcome,
+            }
+            atomic_json_write(path, stored, mode=0o600)
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 REGISTRATION_PATH = HERMES_ROOT / "companion" / "apns-registration.json"
 START_CLAIMS_DIR = HERMES_ROOT / "companion" / "live-activity-start-claims"
 
-_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32,256}$")
+_HEX_TOKEN_RE = re.compile(r"[0-9a-fA-F]{32,256}")
+_REGISTRATION_FIELDS = {
+    "activity_token": "activityToken", "push_to_start_token": "pushToStartToken",
+    "device_token": "deviceToken", "environment": "environment",
+}
+BANNER_SCRIPT = HERMES_ROOT / "scripts" / "companion-live-activity-banner.py"
+_COMMUNICATION_ID_RE = re.compile(r"[A-Za-z0-9:|@+._-]{1,128}")
+
+
+def valid_push_registration(payload: Any) -> bool:
+    if not isinstance(payload, dict) or not payload or payload.keys() - _REGISTRATION_FIELDS.keys():
+        return False
+    for key, value in payload.items():
+        if key == "environment":
+            if value not in ("sandbox", "production"):
+                return False
+        elif key == "activity_token" and value is None:
+            continue
+        elif not isinstance(value, str) or not _HEX_TOKEN_RE.fullmatch(value):
+            return False
+    return True
+
+
+def record_push_registration(
+    payload: dict, *, path: Path = REGISTRATION_PATH, claims_dir: Path = START_CLAIMS_DIR,
+) -> bool:
+    """Merge incremental phone tokens atomically; explicit null clears an ended activity."""
+    if not valid_push_registration(payload):
+        return False
+    try:
+        with _file_lock(path.with_suffix(".lock"), threading.local(), 5, "Registration store busy"):
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                stored = {}
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(stored, dict):
+                return False
+            release_claims = False
+            for key, value in payload.items():
+                field = _REGISTRATION_FIELDS[key]
+                if field in ("activityToken", "pushToStartToken") and stored.get(field) != value:
+                    release_claims = True
+                if value is None:
+                    stored.pop(field, None)
+                else:
+                    stored[field] = value
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                atomic_json_write(path, stored, mode=0o600)
+            except OSError:
+                return False
+            if release_claims:
+                try:
+                    for claim in claims_dir.iterdir():
+                        if claim.is_file() and claim.suffix != ".lock":
+                            claim.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return True
+    except OSError:
+        return False
 
 
 def record_activity_token(
-    token: str,
-    *,
-    path: Path = REGISTRATION_PATH,
-    claims_dir: Path = START_CLAIMS_DIR,
+    token: str, *, path: Path = REGISTRATION_PATH, claims_dir: Path = START_CLAIMS_DIR,
 ) -> bool:
-    """Grava o token da Live Activity e solta o claim de start que o travava.
+    return record_push_registration({"activity_token": token}, path=path, claims_dir=claims_dir)
 
-    Sem o token, o script do banner não consegue `update` e cai no `start`; com
-    o claim em `confirmed` ele então difere o start e devolve sucesso sem postar
-    nada. Renovar o token sem soltar o claim manteria o deadlock de pé.
-    """
-    if not _HEX_TOKEN_RE.match(token or ""):
-        return False
-    try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        stored = {}
-    if not isinstance(stored, dict):
-        stored = {}
-    if stored.get("activityToken") == token:
-        return True
 
-    stored["activityToken"] = token
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
+def valid_communication_id(identifier: Any) -> bool:
+    return isinstance(identifier, str) and bool(_COMMUNICATION_ID_RE.fullmatch(identifier))
 
-    # Um token novo significa Activity nova: todo claim de start anterior descreve
-    # uma Activity que não existe mais.
-    try:
-        for claim in claims_dir.iterdir():
-            if claim.is_file() and claim.suffix not in {".lock"}:
-                claim.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return True
+
+async def dismiss_communication(identifier: str) -> dict:
+    if not valid_communication_id(identifier):
+        return {"ok": False, "error": "invalid_communication_id", "retryable": False}
+
+    def run() -> dict:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(BANNER_SCRIPT), "dismiss", "--payload-stdin"],
+                input=json.dumps({"id": identifier}), capture_output=True, text=True, timeout=45,
+            )
+            body = json.loads(result.stdout)
+            if result.returncode == 0 and isinstance(body, dict) and body.get("ok") is True:
+                return {"ok": True}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+        return {"ok": False, "error": "dismiss_unavailable", "retryable": True}
+
+    return await asyncio.to_thread(run)

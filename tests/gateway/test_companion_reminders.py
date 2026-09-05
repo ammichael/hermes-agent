@@ -146,7 +146,7 @@ class TestPlanAck:
         older["revision"] = 2
 
         assert record_plan_ack(newer, path=path) is True
-        assert record_plan_ack(older, path=path) is False
+        assert record_plan_ack(older, path=path) is True
 
         stored = json.loads(path.read_text())
         assert stored["wake-x|2026-08-09"]["revision"] == 9

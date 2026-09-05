@@ -28,13 +28,14 @@ def _adapter(auth_response=None):
     return SimpleNamespace(_check_auth=lambda request: auth_response)
 
 
-def test_route_table_exposes_the_four_phone_routes():
+def test_route_table_exposes_the_five_phone_routes():
     table = routes_mod._http_routes(_adapter())
     assert [(m, p) for m, p, _ in table] == [
         ("POST", "/api/companion/reminders/{reminder_id}/action"),
         ("GET", "/api/companion/reminders/plans"),
         ("POST", "/api/companion/reminders/plan-ack"),
         ("POST", "/api/companion/live-activity/token"),
+        ("POST", "/api/companion/live-activity/dismiss"),
     ]
     assert all(callable(handler) for _, _, handler in table)
 
