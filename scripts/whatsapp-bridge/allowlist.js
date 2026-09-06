@@ -1,5 +1,19 @@
 import path from 'path';
 import { existsSync, readFileSync } from 'fs';
+import { findTemporaryReplyGrant, captureTemporaryReply } from './temporary_replies.js';
+
+// One inbound gate: temporary admission is capture, NEVER gateway authorization.
+export function routeIncomingUser(msg, { allowedUsers, sessionDir, home, mode, dmPolicy, now }) {
+  if (mode === 'self-chat') return 'deny';
+  const sender = msg?.key?.participant || msg?.key?.remoteJid;
+  if (matchesAllowedUser(sender, allowedUsers, sessionDir)) return 'forward';
+  const grant = findTemporaryReplyGrant(msg, { home, sessionDir, now });
+  if (grant) {
+    try { captureTemporaryReply(msg, grant, home, now); return 'captured'; }
+    catch { return 'capture_failed'; }
+  }
+  return dmPolicy === 'pairing' ? 'forward' : 'deny';
+}
 
 export function normalizeWhatsAppIdentifier(value) {
   return String(value || '')

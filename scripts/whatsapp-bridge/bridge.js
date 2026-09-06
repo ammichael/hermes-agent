@@ -30,7 +30,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, routeIncomingUser } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -329,6 +329,9 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.participant
     || chatId
   );
+  // Poll updates have a separate ingress path; temporary DMs must not bypass capture-only.
+  if (WHATSAPP_MODE === 'bot' && !chatId.endsWith('@g.us') &&
+      !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) return;
   const pollId = key?.id
     || update?.pollUpdates?.[0]?.pollCreationMessageKey?.id
     || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.id
@@ -636,26 +639,19 @@ async function startSocket() {
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
       if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
+        const route = routeIncomingUser(msg, {
+          allowedUsers: ALLOWED_USERS, sessionDir: SESSION_DIR,
+          mode: WHATSAPP_MODE, dmPolicy: WHATSAPP_DM_POLICY,
+        });
+        if (route !== 'forward') {
+          // Capture-only stops before media extraction, poll handling and gateway queues.
+          // Never include untrusted message content or filesystem errors in logs.
+          if (route === 'capture_failed') console.error('[bridge] temporary_reply_capture_failed');
+          const reason = route === 'deny'
+            ? (WHATSAPP_MODE === 'self-chat' ? 'self_chat_mode_rejects_non_self' : 'allowlist_mismatch')
+            : route;
+          if (route === 'deny') console.log(JSON.stringify({ event: 'ignored', reason, chatId, senderId }));
+          else emitDebugEvent({ stage: 'ignored', reason });
           continue;
         }
       }
