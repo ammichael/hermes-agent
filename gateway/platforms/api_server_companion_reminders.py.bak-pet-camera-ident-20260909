@@ -38,12 +38,6 @@ async def _handle_reminder_action(adapter, request: "web.Request") -> "web.Respo
     invalid = _companion_reminders.validate_action_request(reminder_id, payload)
     if invalid:
         return web.json_response({"ok": False, "error": invalid}, status=400)
-    if _companion_reminders.is_pet_camera_reminder(reminder_id):
-        # Identification taps: no must-confirm mutation; n-bridge → Laura/N.
-        result = await _companion_reminders.run_pet_camera_identification(
-            reminder_id, payload
-        )
-        return web.json_response(result)
     result = await _companion_reminders.run_reminder_action(
         reminder_id,
         str(payload["kind"]),

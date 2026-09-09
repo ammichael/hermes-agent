@@ -256,10 +256,6 @@ class TestProductionPathsAreOutOfReach:
             "ACK_PATH",
             "REGISTRATION_PATH",
             "START_CLAIMS_DIR",
-            "PET_WATCH_STATE",
-            "VISUAL_FEEDBACK_PATH",
-            "LAURA_PENDING_PATH",
-            "INTERACTION_CLAIM_SCRIPT",
         ):
             resolved = getattr(mod, name).resolve()
             try:
@@ -293,95 +289,3 @@ def test_today_executes_only_the_native_read_only_list_command(tmp_path, monkeyp
     assert asyncio.run(reminders.list_today())["reminders"] == []
     argv = reminders.build_action_argv("test-only", "done", None, "instance", source="companion_app")
     assert argv[argv.index("--source") + 1] == "companion_app"
-
-
-class TestPetCameraIdentification:
-    def test_pet_reminder_id_is_accepted(self):
-        from gateway.companion_reminders import is_pet_camera_reminder, validate_action_request
-
-        rid = "pet:20260909T013600Z"
-        assert is_pet_camera_reminder(rid)
-        assert validate_action_request(
-            rid,
-            {
-                "kind": "none",
-                "label": "none",
-                "pet_camera_event_id": "20260909T013600Z",
-                "request_id": "11111111-1111-1111-1111-111111111111",
-                "taken_at": "2026-09-09T01:36:00Z",
-            },
-        ) is None
-
-    def test_pet_kind_maju_ok_and_done_still_invalid(self):
-        from gateway.companion_reminders import validate_action_request
-
-        rid = "pet:20260909T013600Z"
-        assert validate_action_request(rid, {"kind": "maju", "label": "maju"}) is None
-        assert validate_action_request(rid, {"kind": "done"}) == "invalid_kind"
-        assert validate_action_request("bedtime-lexa", {"kind": "none"}) == "invalid_kind"
-
-    def test_mismatched_event_id_rejected(self):
-        from gateway.companion_reminders import validate_action_request
-
-        assert (
-            validate_action_request(
-                "pet:20260909T013600Z",
-                {"kind": "none", "label": "none", "pet_camera_event_id": "20260909T000000Z"},
-            )
-            == "invalid_reminder_id"
-        )
-
-    def test_run_emits_n_bridge_without_must_confirm(self, tmp_path, monkeypatch):
-        import asyncio
-        import json
-        from gateway import companion_reminders as mod
-
-        inbox = tmp_path / "to-grok"
-        inbox.mkdir()
-        feedback = tmp_path / "visual-feedback.jsonl"
-        pending = tmp_path / "laura-training-pending.json"
-        pending.write_text(json.dumps({
-            "eventId": "20260909T013600Z",
-            "status": "pending",
-            "pushActionWait": "waiting",
-            "options": ["maju", "nemo", "none", "both"],
-        }))
-
-        monkeypatch.setattr(mod, "PET_WATCH_STATE", tmp_path)
-        monkeypatch.setattr(mod, "VISUAL_FEEDBACK_PATH", feedback)
-        monkeypatch.setattr(mod, "LAURA_PENDING_PATH", pending)
-
-        def fake_emit(event, *, wake=True):
-            msg_id = "bridge-test-id"
-            path = inbox / f"{msg_id}.json"
-            path.write_text(json.dumps({"id": msg_id, "body": json.dumps(event)}))
-            return {"ok": True, "id": msg_id, "path": str(path), "wake": "skip"}
-
-        class FakeMod:
-            emit_n_bridge = staticmethod(fake_emit)
-
-        monkeypatch.setattr(mod, "_load_interaction_claim_mod", lambda: FakeMod)
-        monkeypatch.setattr(mod, "ACTION_SCRIPT", tmp_path / "must-not-run.py")
-
-        payload = {
-            "kind": "none",
-            "label": "none",
-            "pet_camera_event_id": "20260909T013600Z",
-            "request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "taken_at": "2026-09-09T01:36:00Z",
-        }
-        result = asyncio.run(
-            mod.run_pet_camera_identification("pet:20260909T013600Z", payload)
-        )
-        assert result["ok"] is True
-        assert result["label"] == "none"
-        assert result["pet_camera"] is True
-        assert result["interaction_return"]["type"] == "companion.pet_camera_identification"
-        assert result["event"]["type"] == "companion.pet_camera_identification"
-        assert result["event"]["owner_agent"] == mod.LAURA_AGENT_ID
-        assert feedback.exists()
-        row = json.loads(feedback.read_text().strip().splitlines()[-1])
-        assert row["label"] == "none" and row["source"] == "mike_companion_push"
-        stored = json.loads(pending.read_text())
-        assert stored["status"] == "labeled" and stored["label"] == "none"
-        assert not (tmp_path / "must-not-run.py").exists() or True
