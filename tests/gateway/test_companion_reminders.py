@@ -370,6 +370,7 @@ class TestPetCameraIdentification:
             "request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "taken_at": "2026-09-09T01:36:00Z",
         }
+        monkeypatch.setattr(mod, "_run_stamp_pet_label", lambda event_id, label: {"ok": True, "eventId": event_id, "label": label, "source": "mike_companion_push"})
         result = asyncio.run(
             mod.run_pet_camera_identification("pet:20260909T013600Z", payload)
         )
@@ -384,4 +385,32 @@ class TestPetCameraIdentification:
         assert row["label"] == "none" and row["source"] == "mike_companion_push"
         stored = json.loads(pending.read_text())
         assert stored["status"] == "labeled" and stored["label"] == "none"
+        assert result["stamps"]["stamp"]["ok"] is True
         assert not (tmp_path / "must-not-run.py").exists() or True
+
+    def test_no_image_is_accepted_and_skips_album_stamp(self, monkeypatch):
+        from gateway.companion_reminders import validate_action_request
+        from gateway import companion_reminders as mod
+
+        rid = "pet:20260909T013600Z"
+        assert validate_action_request(rid, {"kind": "no_image", "label": "no_image"}) is None
+
+        called = []
+        monkeypatch.setattr(mod, "_run_stamp_pet_label", lambda event_id, label: called.append((event_id, label)) or {"ok": True})
+        monkeypatch.setattr(mod, "_load_interaction_claim_mod", lambda: None)
+        result = __import__("asyncio").run(
+            mod.run_pet_camera_identification(
+                rid,
+                {
+                    "kind": "no_image",
+                    "label": "no_image",
+                    "pet_camera_event_id": "20260909T013600Z",
+                    "request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "taken_at": "2026-09-09T01:36:00Z",
+                },
+            )
+        )
+        assert result["ok"] is True
+        assert result["label"] == "no_image"
+        assert result["stamps"]["stamp"] == {"ok": True, "skipped": "no_image"}
+        assert called == []

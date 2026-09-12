@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -56,13 +57,14 @@ INSTANCE_KEY_RE = re.compile(r"^[A-Za-z0-9._:+-]{1,120}$")
 # These never mutate must-confirm state; they forward to Laura via n-bridge.
 PET_CAMERA_REMINDER_RE = re.compile(r"^pet:20\d{6}T\d{6}Z$")
 PET_CAMERA_EVENT_RE = re.compile(r"^20\d{6}T\d{6}Z$")
-PET_CAMERA_KINDS = frozenset({"maju", "nemo", "none", "both"})
+PET_CAMERA_KINDS = frozenset({"maju", "nemo", "none", "both", "no_image"})
 LAURA_AGENT_ID = "36e79656-9a36-4658-b303-544b51bb3bef"
 GROK_N_AGENT_ID = "15c69e7c-7597-41da-9010-04418b0828e1"
 PET_WATCH_STATE = HERMES_ROOT / "state" / "eufy-pet-watch"
 VISUAL_FEEDBACK_PATH = PET_WATCH_STATE / "visual-feedback.jsonl"
 LAURA_PENDING_PATH = PET_WATCH_STATE / "laura-training-pending.json"
 INTERACTION_CLAIM_SCRIPT = HERMES_ROOT / "scripts" / "companion-interaction-claim.py"
+STAMP_PET_LABEL = HERMES_ROOT / "integrations" / "eufy-pet-watch" / "stamp-pet-label.js"
 
 # O script chama outros dois com timeouts de 45 s e 60 s, e ainda espera um lock
 # de estado. Dois minutos é folga sobre o pior caso medido, não um chute.
@@ -270,7 +272,42 @@ def _stamp_pet_camera_feedback(event_id: str, label: str) -> Dict[str, Any]:
                 out["laura_pending"] = True
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         out["laura_pending_error"] = type(exc).__name__
+    if label != "no_image":
+        out["stamp"] = _run_stamp_pet_label(event_id, label)
+    else:
+        out["stamp"] = {"ok": True, "skipped": "no_image"}
     return out
+
+
+def _run_stamp_pet_label(event_id: str, label: str) -> Dict[str, Any]:
+    """Album write via stamp-pet-label.js. Isolated by EUFY_PET_WATCH_STATE_DIR."""
+    if not STAMP_PET_LABEL.is_file():
+        return {"ok": False, "reason": "stamp-missing"}
+    node = "/opt/homebrew/bin/node" if Path("/opt/homebrew/bin/node").is_file() else "node"
+    env = dict(os.environ)
+    env["STAMP_SOURCE"] = "mike_companion_push"
+    env["EUFY_PET_WATCH_STATE_DIR"] = str(PET_WATCH_STATE)
+    try:
+        completed = subprocess.run(
+            [node, str(STAMP_PET_LABEL), event_id, label],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        raw = (completed.stdout or completed.stderr or "").strip().splitlines()
+        payload = {}
+        if raw:
+            try:
+                payload = json.loads(raw[-1])
+            except json.JSONDecodeError:
+                payload = {"ok": False, "reason": "unparsed"}
+        if completed.returncode != 0 and "ok" not in payload:
+            payload = {"ok": False, "reason": payload.get("reason") or f"exit-{completed.returncode}"}
+        return payload if isinstance(payload, dict) else {"ok": False, "reason": "invalid-stamp"}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "reason": type(exc).__name__}
 
 
 def _emit_pet_camera_n_bridge(event: Dict[str, Any]) -> Dict[str, Any]:
